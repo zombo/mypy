@@ -937,7 +937,9 @@ def find_module_paths_using_imports(modules: List[str], packages: List[str],
     """
     py_modules = []  # type: List[StubSource]
     c_modules = []  # type: List[StubSource]
-    modules = modules + list(walk_packages(packages))
+    found = list(walk_packages(packages))
+    found = remove_test_modules(found)  # We don't want to run any tests
+    modules = modules + found
     for mod in modules:
         try:
             if pyversion[0] == 2:
@@ -955,6 +957,12 @@ def find_module_paths_using_imports(modules: List[str], packages: List[str],
             path, runtime_all = result
             py_modules.append(StubSource(mod, path, runtime_all))
     return py_modules, c_modules
+
+
+def remove_test_modules(modules: List[str]) -> List[str]:
+    """Remove anything from modules that looks like a test."""
+    return [module for module in modules
+            if not module.endswith('.tests') and '.tests.' not in module]
 
 
 def find_module_paths_using_search(modules: List[str], packages: List[str],
