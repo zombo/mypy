@@ -92,10 +92,11 @@ if MYPY:
     from typing_extensions import Final
 
 
-# Avoid some file names that are likely to cause trouble (\n for end of path).
+# Avoid some file names that are unnecessary or likely to cause trouble (\n for end of path).
 BLACKLIST = [
     '/six.py\n',  # Likely vendored six; too dynamic for us to handle
     '/vendored/',  # Vendored packages
+    '/vendor/',  # Vendored packages
 ]
 
 
@@ -969,7 +970,9 @@ def find_module_paths_using_imports(modules: List[str], packages: List[str],
 def remove_test_modules(modules: List[str]) -> List[str]:
     """Remove anything from modules that looks like a test."""
     return [module for module in modules
-            if not module.endswith('.tests') and '.tests.' not in module]
+            if (not module.endswith(('.tests', '.test'))
+                and '.tests.' not in module
+                and '.test.' not in module)]
 
 
 def find_module_paths_using_search(modules: List[str], packages: List[str],
