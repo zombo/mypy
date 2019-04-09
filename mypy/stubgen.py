@@ -92,6 +92,12 @@ if MYPY:
     from typing_extensions import Final
 
 
+# Avoid some file names that are likely to cause trouble.
+BLACKLIST = [
+    '/six.py',  # Likely vendored six; too dynamic for us to handle
+]
+
+
 class Options:
     """Represents stubgen options.
 
@@ -881,6 +887,12 @@ def get_qualified_name(o: Expression) -> str:
         return ERROR_MARKER
 
 
+def remove_blacklisted_modules(modules: List[StubSource]) -> List[StubSource]:
+    return [module for module in modules
+            if not any(module.path.endswith(suffix)
+                       for suffix in BLACKLIST)]
+
+
 def collect_build_targets(options: Options, mypy_opts: MypyOptions) -> Tuple[List[StubSource],
                                                                              List[StubSource]]:
     """Collect files for which we need to generate stubs.
@@ -908,6 +920,8 @@ def collect_build_targets(options: Options, mypy_opts: MypyOptions) -> Tuple[Lis
             raise SystemExit(str(e))
         py_modules = [StubSource(m.module, m.path) for m in source_list]
         c_modules = []
+
+    py_modules = remove_blacklisted_modules(py_modules)
 
     return py_modules, c_modules
 
