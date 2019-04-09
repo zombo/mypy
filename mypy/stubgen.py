@@ -92,9 +92,10 @@ if MYPY:
     from typing_extensions import Final
 
 
-# Avoid some file names that are likely to cause trouble.
+# Avoid some file names that are likely to cause trouble (\n for end of path).
 BLACKLIST = [
-    '/six.py',  # Likely vendored six; too dynamic for us to handle
+    '/six.py\n',  # Likely vendored six; too dynamic for us to handle
+    '/vendored/',  # Vendored packages
 ]
 
 
@@ -895,8 +896,8 @@ def get_qualified_name(o: Expression) -> str:
 
 def remove_blacklisted_modules(modules: List[StubSource]) -> List[StubSource]:
     return [module for module in modules
-            if not any(module.path.endswith(suffix)
-                       for suffix in BLACKLIST)]
+            if not any(substr in (module.path + '\n')
+                       for substr in BLACKLIST)]
 
 
 def collect_build_targets(options: Options, mypy_opts: MypyOptions) -> Tuple[List[StubSource],
