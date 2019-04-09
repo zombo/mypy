@@ -1435,3 +1435,23 @@ from typing import Any
 class C(Base, metaclass=abc.ABCMeta):
     @abstractmethod
     def other(self) -> Any: ...
+
+[case testUnreachableCode_semanal]
+MYPY = False
+class A: pass
+if MYPY:
+    class C(A):
+        def f(self) -> None: pass
+else:
+    def f(i):
+        return i
+
+    class C(A):
+        def g(self) -> None: pass
+[out]
+MYPY: bool
+
+class A: ...
+
+class C(A):
+    def f(self) -> None: ...
