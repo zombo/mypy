@@ -455,49 +455,68 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
         is_abstract = False
         for decorator in o.original_decorators:
             if isinstance(decorator, NameExpr):
-                if decorator.name in ('property',
-                                      'staticmethod',
-                                      'classmethod'):
-                    self.add('%s@%s\n' % (self._indent, decorator.name))
-                elif self.import_tracker.module_for.get(decorator.name) in ('asyncio',
-                                                                            'asyncio.coroutines',
-                                                                            'types'):
-                    self.add_coroutine_decorator(o.func, decorator.name, decorator.name)
-                elif (self.import_tracker.module_for.get(decorator.name) == 'abc' and
-                      (decorator.name == 'abstractmethod' or
-                       self.import_tracker.reverse_alias.get(decorator.name) == 'abstractmethod')):
-                    self.add('%s@%s\n' % (self._indent, decorator.name))
-                    self.import_tracker.require_name(decorator.name)
+                if self.process_name_expr_decorator(decorator, o):
                     is_abstract = True
             elif isinstance(decorator, MemberExpr):
-                if decorator.name == 'setter' and isinstance(decorator.expr, NameExpr):
-                    self.add('%s@%s.setter\n' % (self._indent, decorator.expr.name))
-                elif (isinstance(decorator.expr, NameExpr) and
-                      (decorator.expr.name == 'abc' or
-                       self.import_tracker.reverse_alias.get('abc')) and
-                      decorator.name == 'abstractmethod'):
-                    self.import_tracker.require_name(decorator.expr.name)
-                    self.add('%s@%s.%s\n' % (self._indent, decorator.expr.name, decorator.name))
+                if self.process_member_expr_decorator(decorator, o):
                     is_abstract = True
-                elif decorator.name == 'coroutine':
-                    if (isinstance(decorator.expr, MemberExpr) and
-                        decorator.expr.name == 'coroutines' and
-                        isinstance(decorator.expr.expr, NameExpr) and
-                            (decorator.expr.expr.name == 'asyncio' or
-                             self.import_tracker.reverse_alias.get(decorator.expr.expr.name) ==
-                                'asyncio')):
-                        self.add_coroutine_decorator(o.func,
-                                                     '%s.coroutines.coroutine' %
-                                                     (decorator.expr.expr.name,),
-                                                     decorator.expr.expr.name)
-                    elif (isinstance(decorator.expr, NameExpr) and
-                          (decorator.expr.name in ('asyncio', 'types') or
-                           self.import_tracker.reverse_alias.get(decorator.expr.name) in
-                            ('asyncio', 'asyncio.coroutines', 'types'))):
-                        self.add_coroutine_decorator(o.func,
-                                                     decorator.expr.name + '.coroutine',
-                                                     decorator.expr.name)
         self.visit_func_def(o.func, is_abstract=is_abstract)
+
+    def process_name_expr_decorator(self, expr: NameExpr, context: Decorator) -> bool:
+        is_abstract = False
+        name = expr.name
+        if name in ('property', 'staticmethod', 'classmethod'):
+            self.add_decorator(name)
+        elif self.import_tracker.module_for.get(name) in ('asyncio',
+                                                          'asyncio.coroutines',
+                                                          'types'):
+            self.add_coroutine_decorator(context.func, name, name)
+        elif any(self.refers_to_fullname(name, target)
+                 for target in ('abc.abstractmethod', 'abc.abstractproperty')):
+            self.add_decorator(name)
+            self.import_tracker.require_name(name)
+            is_abstract = True
+        return is_abstract
+
+    def refers_to_fullname(self, name: str, fullname: str) -> bool:
+        module, short = fullname.rsplit('.', 1)
+        return (self.import_tracker.module_for.get(name) == module and
+                (name == short or
+                 self.import_tracker.reverse_alias.get(name) == short))
+
+    def process_member_expr_decorator(self, expr: MemberExpr, context: Decorator) -> bool:
+        is_abstract = False
+        if expr.name == 'setter' and isinstance(expr.expr, NameExpr):
+            self.add_decorator('%s.setter' % expr.expr.name)
+        elif (isinstance(expr.expr, NameExpr) and
+              (expr.expr.name == 'abc' or
+               self.import_tracker.reverse_alias.get('abc')) and
+              expr.name in ('abstractmethod', 'abstractproperty')):
+            self.import_tracker.require_name(expr.expr.name)
+            self.add_decorator('%s.%s' % (expr.expr.name, expr.name))
+            is_abstract = True
+        elif expr.name == 'coroutine':
+            if (isinstance(expr.expr, MemberExpr) and
+                expr.expr.name == 'coroutines' and
+                isinstance(expr.expr.expr, NameExpr) and
+                    (expr.expr.expr.name == 'asyncio' or
+                     self.import_tracker.reverse_alias.get(expr.expr.expr.name) ==
+                        'asyncio')):
+                self.add_coroutine_decorator(context.func,
+                                             '%s.coroutines.coroutine' %
+                                             (expr.expr.expr.name,),
+                                             expr.expr.expr.name)
+            elif (isinstance(expr.expr, NameExpr) and
+                  (expr.expr.name in ('asyncio', 'types') or
+                   self.import_tracker.reverse_alias.get(expr.expr.name) in
+                    ('asyncio', 'asyncio.coroutines', 'types'))):
+                self.add_coroutine_decorator(context.func,
+                                             expr.expr.name + '.coroutine',
+                                             expr.expr.name)
+        return is_abstract
+
+    def add_decorator(self, name: str) -> None:
+        self.add('%s@%s\n' % (self._indent, name))
 
     def visit_class_def(self, o: ClassDef) -> None:
         sep = None  # type: Optional[int]
