@@ -3,7 +3,7 @@ import re
 import pprint
 import sys
 
-from typing import Dict, List, Mapping, Optional, Pattern, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Pattern, Set, Tuple, Callable, AnyStr
 MYPY = False
 if MYPY:
     from typing_extensions import Final
@@ -240,6 +240,8 @@ class Options:
         self.cache_map = {}  # type: Dict[str, Tuple[str, str]]
         # Don't properly free objects on exit, just kill the current process.
         self.fast_exit = False
+        # Used to transform source code before parsing if not None
+        self.transform_source = None  # type: Optional[Callable[[AnyStr], AnyStr]]
 
     def snapshot(self) -> object:
         """Produce a comparable snapshot of this Option"""
