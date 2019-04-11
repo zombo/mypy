@@ -1559,3 +1559,13 @@ from six.moves import http_client, queue as queue
 
 class C(http_client.HTTPMessage): ...
 class D(six.Iterator): ...
+
+[case testInvalidNumberOfArgsInAnnotation]
+def f(x):
+    # type: () -> int
+    return ''
+
+[out]
+from typing import Any
+
+def f(x: Any): ...
