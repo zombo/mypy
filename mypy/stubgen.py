@@ -1119,7 +1119,7 @@ def find_module_paths_using_imports(modules: List[str],
     """
     py_modules = []  # type: List[StubSource]
     c_modules = []  # type: List[StubSource]
-    found = list(walk_packages(packages))
+    found = list(walk_packages(packages, verbose))
     found = remove_test_modules(found)  # We don't want to run any tests
     modules = modules + found
     for mod in modules:
