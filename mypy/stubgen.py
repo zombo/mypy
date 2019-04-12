@@ -1053,8 +1053,8 @@ def get_qualified_name(o: Expression) -> str:
 
 def remove_blacklisted_modules(modules: List[StubSource]) -> List[StubSource]:
     return [module for module in modules
-            if not any(substr in (module.path + '\n')
-                       for substr in BLACKLIST)]
+            if module.path is None or not any(substr in (module.path + '\n')
+                                              for substr in BLACKLIST)]
 
 
 def collect_build_targets(options: Options, mypy_opts: MypyOptions) -> Tuple[List[StubSource],
