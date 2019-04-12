@@ -1221,13 +1221,16 @@ class SemanticAnalyzerPass2(NodeVisitor[None],
         # the bases of defn include classes imported from other
         # modules in an import loop. We'll recompute it in SemanticAnalyzerPass3.
         if not self.verify_base_classes(defn):
-            # Give it an MRO consisting of just the class itself and object.
-            defn.info.mro = [defn.info, self.object_type().type]
-            defn.info.bad_mro = True
+            self.set_dummy_mro(defn.info)
             return
         # TODO: Ideally we should move MRO calculation to a later stage, but this is
         # not easy, see issue #5536.
         self.calculate_class_mro(defn, self.object_type)
+
+    def set_dummy_mro(self, info: TypeInfo) -> None:
+        # Give it an MRO consisting of just the class itself and object.
+        info.mro = [info, self.object_type().type]
+        info.bad_mro = True
 
     def calculate_class_mro(self, defn: ClassDef,
                             obj_type: Optional[Callable[[], Instance]] = None) -> None:
@@ -1240,9 +1243,9 @@ class SemanticAnalyzerPass2(NodeVisitor[None],
         try:
             calculate_mro(defn.info, obj_type)
         except MroError:
-            self.fail_blocker('Cannot determine consistent method resolution '
-                              'order (MRO) for "%s"' % defn.name, defn)
-            defn.info.mro = []
+            self.fail('Cannot determine consistent method resolution '
+                      'order (MRO) for "%s"' % defn.name, defn)
+            self.set_dummy_mro(defn.info)
         # Allow plugins to alter the MRO to handle the fact that `def mro()`
         # on metaclasses permits MRO rewriting.
         if defn.fullname:
