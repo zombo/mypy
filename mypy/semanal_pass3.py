@@ -182,7 +182,7 @@ class SemanticAnalyzerPass3(TraverserVisitor, SemanticAnalyzerCoreInterface):
         # Recompute MRO now that we have analyzed all modules, to pick
         # up superclasses of bases imported from other modules in an
         # import loop. (Only do so if we succeeded the first time.)
-        if tdef.info.mro:
+        if tdef.info.mro and not tdef.info.bad_mro:
             tdef.info.mro = []  # Force recomputation
             self.sem.calculate_class_mro(tdef)
         if tdef.analyzed is not None:
