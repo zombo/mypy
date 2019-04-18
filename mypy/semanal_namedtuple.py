@@ -162,10 +162,15 @@ class NamedTupleAnalyzer:
             info = self.build_namedtuple_typeinfo(name, [], [], {})
             self.store_namedtuple_info(info, name, call, is_typed)
             return info
-        name = cast(Union[StrExpr, BytesExpr, UnicodeExpr], call.args[0]).value
-        if name != var_name or is_func_scope:
+
+        if var_name:
+            name = var_name
+        else:
+            name = cast(Union[StrExpr, BytesExpr, UnicodeExpr], call.args[0]).value
+        if var_name is None or is_func_scope:
             # Give it a unique name derived from the line number.
             name += '@' + str(call.line)
+
         if len(defaults) > 0:
             default_items = {
                 arg_name: default

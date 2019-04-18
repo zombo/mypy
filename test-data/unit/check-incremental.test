@@ -4947,7 +4947,7 @@ from typing import NamedTuple
 NT = NamedTuple('BadName', [('x', int)])
 [out]
 [out2]
-tmp/a.py:3: error: Revealed type is 'Tuple[builtins.int, fallback=b.BadName@2]'
+tmp/a.py:3: error: Revealed type is 'Tuple[builtins.int, fallback=b.NT]'
 
 [case testNewAnalyzerIncrementalBrokenNamedTupleNested]
 # flags: --new-semantic-analyzer
