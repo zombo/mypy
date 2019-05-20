@@ -86,22 +86,20 @@ if os.getenv('MYPY_USE_MYPYC', None) == '1':
 
 if USE_MYPYC:
     MYPYC_BLACKLIST = (
-        # Need to be runnable as scripts
-        '__main__.py',
-        'sitepkgs.py',
-        'dmypy/__main__.py',
-
-        # Needs to be interpreted to provide a hook to interpreted plugins
+        # Designed to collect things that can't be compiled
+        'mypyc_hacks.py',
         'interpreted_plugin.py',
 
-        # Uses __getattr__/__setattr__
-        'split_namespace.py',
+        # Can't be compiled because they need to be runnable as scripts
+        '__main__.py',
+        'sitepkgs.py',
 
-        # Lies to mypy about code reachability
+        # Can't be compiled because something goes wrong
         'bogus_type.py',
-
-        # We don't populate __file__ properly at the top level or something?
-        # Also I think there would be problems with how we generate version.py.
+        'dmypy.py',
+        'gclogger.py',
+        'main.py',
+        'memprofile.py',
         'version.py',
     )
 
@@ -171,7 +169,7 @@ setup(name='mypy',
       package_data={'mypy': package_data},
       entry_points={'console_scripts': ['mypy=mypy.__main__:console_entry',
                                         'stubgen=mypy.stubgen:main',
-                                        'dmypy=mypy.dmypy.client:console_entry',
+                                        'dmypy=mypy.dmypy:console_entry',
                                         ]},
       classifiers=classifiers,
       cmdclass=cmdclass,

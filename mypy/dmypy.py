@@ -31,8 +31,7 @@ class AugmentedHelpFormatter(argparse.RawDescriptionHelpFormatter):
         super().__init__(prog=prog, max_help_position=30)
 
 
-parser = argparse.ArgumentParser(prog='dmypy',
-                                 description="Client for mypy daemon mode",
+parser = argparse.ArgumentParser(description="Client for mypy daemon mode",
                                  fromfile_prefix_chars='@')
 parser.set_defaults(action=None)
 parser.add_argument('--status-file', default=DEFAULT_STATUS_FILE,
@@ -461,7 +460,7 @@ def request(status_file: str, command: str, *, timeout: Optional[int] = None,
     """
     response = {}  # type: Dict[str, str]
     args = dict(kwds)
-    args['command'] = command
+    args.update(command=command)
     bdata = json.dumps(args).encode('utf8')
     _, name = get_status(status_file)
     try:
@@ -538,3 +537,7 @@ def is_running(status_file: str) -> bool:
 # Run main().
 def console_entry() -> None:
     main(sys.argv[1:])
+
+
+if __name__ == '__main__':
+    console_entry()
