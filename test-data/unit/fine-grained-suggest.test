@@ -177,7 +177,7 @@ Foo('lol')
 
 [case testSuggestInferMethod1]
 # flags: --strict-optional
-# suggest: foo.Foo.foo
+# suggest: --no-any foo.Foo.foo
 [file foo.py]
 class Foo:
     def __init__(self) -> None:

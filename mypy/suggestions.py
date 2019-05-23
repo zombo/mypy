@@ -222,7 +222,9 @@ class SuggestionEngine:
         types = []  # type: List[List[Type]]
         for i in range(len(base.arg_kinds)):
             # Make self args Any but this will get overriden somewhere in the checker
+            # We call this a special form so that has_any_type doesn't consider it to be a real any
             if i == 0 and is_method:
+#                types.append([AnyType(TypeOfAny.special_form)])
                 types.append([AnyType(TypeOfAny.explicit)])
                 continue
 
