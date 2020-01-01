@@ -1,7 +1,5 @@
 """Plugin that provides support for dataclasses."""
 
-from collections import OrderedDict
-
 from typing import Dict, List, Set, Tuple, Optional
 from typing_extensions import Final
 
@@ -98,7 +96,7 @@ class DataclassTransformer:
             'frozen': _get_decorator_bool_argument(self._ctx, 'frozen', False),
         }
 
-        # If there are no attributes, it may be that the new semantic analyzer has not
+        # If there are no attributes, it may be that the semantic analyzer has not
         # processed them yet. In order to work around this, we can simply skip generating
         # __init__ if there are no attributes, because if the user truly did not define any,
         # then the object default __init__ with an empty signature will be present anyway.
@@ -116,7 +114,7 @@ class DataclassTransformer:
                 decorator_arguments['order']):
             # Type variable for self types in generated methods.
             obj_type = ctx.api.named_type('__builtins__.object')
-            self_tvar_expr = TypeVarExpr(SELF_TVAR_NAME, info.fullname() + '.' + SELF_TVAR_NAME,
+            self_tvar_expr = TypeVarExpr(SELF_TVAR_NAME, info.fullname + '.' + SELF_TVAR_NAME,
                                          [], obj_type)
             info.names[SELF_TVAR_NAME] = SymbolTableNode(MDEF, self_tvar_expr)
 
@@ -127,7 +125,7 @@ class DataclassTransformer:
                 # the same type as self (covariant).  Note the
                 # "self_type" parameter to add_method.
                 obj_type = ctx.api.named_type('__builtins__.object')
-                cmp_tvar_def = TypeVarDef(SELF_TVAR_NAME, info.fullname() + '.' + SELF_TVAR_NAME,
+                cmp_tvar_def = TypeVarDef(SELF_TVAR_NAME, info.fullname + '.' + SELF_TVAR_NAME,
                                           -1, [], obj_type)
                 cmp_other_type = TypeVarType(cmp_tvar_def)
                 cmp_return_type = ctx.api.named_type('__builtins__.bool')
@@ -150,7 +148,7 @@ class DataclassTransformer:
                 # Like for __eq__ and __ne__, we want "other" to match
                 # the self type.
                 obj_type = ctx.api.named_type('__builtins__.object')
-                order_tvar_def = TypeVarDef(SELF_TVAR_NAME, info.fullname() + '.' + SELF_TVAR_NAME,
+                order_tvar_def = TypeVarDef(SELF_TVAR_NAME, info.fullname + '.' + SELF_TVAR_NAME,
                                             -1, [], obj_type)
                 order_other_type = TypeVarType(order_tvar_def)
                 order_return_type = ctx.api.named_type('__builtins__.bool')
@@ -181,7 +179,7 @@ class DataclassTransformer:
         self.reset_init_only_vars(info, attributes)
 
         info.metadata['dataclass'] = {
-            'attributes': OrderedDict((attr.name, attr.serialize()) for attr in attributes),
+            'attributes': [attr.serialize() for attr in attributes],
             'frozen': decorator_arguments['frozen'],
         }
 
@@ -249,7 +247,7 @@ class DataclassTransformer:
             is_init_var = False
             node_type = get_proper_type(node.type)
             if (isinstance(node_type, Instance) and
-                    node_type.type.fullname() == 'dataclasses.InitVar'):
+                    node_type.type.fullname == 'dataclasses.InitVar'):
                 is_init_var = True
                 node.type = node_type.args[0]
 
@@ -271,6 +269,11 @@ class DataclassTransformer:
             elif not isinstance(stmt.rvalue, TempNode):
                 has_default = True
 
+            if not has_default:
+                # Make all non-default attributes implicit because they are de-facto set
+                # on self in the generated __init__(), not in the class body.
+                sym.implicit = True
+
             known_attrs.add(lhs.name)
             attrs.append(DataclassAttribute(
                 name=lhs.name,
@@ -287,38 +290,42 @@ class DataclassTransformer:
         # copy() because we potentially modify all_attrs below and if this code requires debugging
         # we'll have unmodified attrs laying around.
         all_attrs = attrs.copy()
-        init_method = cls.info.get_method('__init__')
         for info in cls.info.mro[1:-1]:
             if 'dataclass' not in info.metadata:
                 continue
 
             super_attrs = []
             # Each class depends on the set of attributes in its dataclass ancestors.
-            ctx.api.add_plugin_dependency(make_wildcard_trigger(info.fullname()))
+            ctx.api.add_plugin_dependency(make_wildcard_trigger(info.fullname))
 
-            for name, data in info.metadata['dataclass']['attributes'].items():
+            for data in info.metadata['dataclass']['attributes']:
+                name = data['name']  # type: str
                 if name not in known_attrs:
                     attr = DataclassAttribute.deserialize(info, data)
-                    if attr.is_init_var and isinstance(init_method, FuncDef):
+                    if attr.is_init_var:
                         # InitVars are removed from classes so, in order for them to be inherited
                         # properly, we need to re-inject them into subclasses' sym tables here.
                         # To do that, we look 'em up from the parents' __init__.  These variables
                         # are subsequently removed from the sym table at the end of
                         # DataclassTransformer.transform.
-                        for arg, arg_name in zip(init_method.arguments, init_method.arg_names):
-                            if arg_name == attr.name:
-                                cls.info.names[attr.name] = SymbolTableNode(MDEF, arg.variable)
+                        superclass_init = info.get_method('__init__')
+                        if isinstance(superclass_init, FuncDef):
+                            attr_node = _get_arg_from_init(superclass_init, attr.name)
+                            if attr_node is not None:
+                                cls.info.names[attr.name] = attr_node
 
                     known_attrs.add(name)
                     super_attrs.append(attr)
-                else:
+                elif all_attrs:
                     # How early in the attribute list an attribute appears is determined by the
                     # reverse MRO, not simply MRO.
                     # See https://docs.python.org/3/library/dataclasses.html#inheritance for
                     # details.
-                    (attr,) = [a for a in all_attrs if a.name == name]
-                    all_attrs.remove(attr)
-                    super_attrs.append(attr)
+                    for attr in all_attrs:
+                        if attr.name == name:
+                            all_attrs.remove(attr)
+                            super_attrs.append(attr)
+                            break
             all_attrs = super_attrs + all_attrs
 
         # Ensure that arguments without a default don't follow
@@ -329,9 +336,13 @@ class DataclassTransformer:
             # doesn't have a default after one that does have one,
             # then that's an error.
             if found_default and attr.is_in_init and not attr.has_default:
+                # If the issue comes from merging different classes, report it
+                # at the class definition point.
+                context = (Context(line=attr.line, column=attr.column) if attr in attrs
+                           else ctx.cls)
                 ctx.api.fail(
                     'Attributes without a default cannot follow attributes with one',
-                    Context(line=attr.line, column=attr.column),
+                    context,
                 )
 
             found_default = found_default or (attr.has_default and attr.is_in_init)
@@ -353,8 +364,16 @@ class DataclassTransformer:
                 var = attr.to_var(info)
                 var.info = info
                 var.is_property = True
-                var._fullname = info.fullname() + '.' + var.name()
-                info.names[var.name()] = SymbolTableNode(MDEF, var)
+                var._fullname = info.fullname + '.' + var.name
+                info.names[var.name] = SymbolTableNode(MDEF, var)
+
+
+def _get_arg_from_init(init_method: FuncDef, attr_name: str) -> Optional[SymbolTableNode]:
+    """Given an init method and an attribute name, find the Var in the init method's args."""
+    for arg, arg_name in zip(init_method.arguments, init_method.arg_names):
+        if arg_name == attr_name:
+            return SymbolTableNode(MDEF, arg.variable)
+    return None
 
 
 def dataclass_class_maker_callback(ctx: ClassDefContext) -> None:

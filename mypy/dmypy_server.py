@@ -131,11 +131,9 @@ CONNECTION_NAME = 'dmypy'  # type: Final
 
 
 def process_start_options(flags: List[str], allow_sources: bool) -> Options:
-    sources, options = mypy.main.process_options(['-i'] + flags,
-                                                 require_targets=False,
-                                                 server_options=True)
-    if sources and not allow_sources:
-        sys.exit("dmypy: start/restart does not accept sources")
+    _, options = mypy.main.process_options(
+        ['-i'] + flags, require_targets=False, server_options=True
+    )
     if options.report_dirs:
         sys.exit("dmypy: start/restart cannot generate reports")
     if options.junit_xml:
@@ -175,6 +173,7 @@ class Server:
 
         self.fscache = FileSystemCache()
 
+        options.raise_exceptions = True
         options.incremental = True
         options.fine_grained_incremental = True
         options.show_traceback = True
@@ -264,8 +263,6 @@ class Server:
                 # Only the above commands use some error formatting.
                 del data['is_tty']
                 del data['terminal_width']
-            elif int(os.getenv('MYPY_FORCE_COLOR', '0')):
-                data['is_tty'] = True
             return method(self, **data)
 
     # Command functions (run in the server via RPC).
@@ -316,9 +313,9 @@ class Server:
             if self.fine_grained_manager:
                 manager = self.fine_grained_manager.manager
                 start_plugins_snapshot = manager.plugins_snapshot
-                _, current_plugins_snapshot = mypy.build.load_plugins(options,
-                                                                      manager.errors,
-                                                                      sys.stdout)
+                _, current_plugins_snapshot = mypy.build.load_plugins(
+                    options, manager.errors, sys.stdout, extra_plugins=()
+                )
                 if current_plugins_snapshot != start_plugins_snapshot:
                     return {'restart': 'plugins changed'}
         except InvalidSourceList as err:
@@ -567,7 +564,9 @@ class Server:
                     **kwargs: Any) -> Dict[str, object]:
         """Suggest a signature for a function."""
         if not self.fine_grained_manager:
-            return {'error': "Command 'suggest' is only valid after a 'check' command"}
+            return {
+                'error': "Command 'suggest' is only valid after a 'check' command"
+                " (that produces no parse errors)"}
         engine = SuggestionEngine(self.fine_grained_manager, **kwargs)
         try:
             if callsites:

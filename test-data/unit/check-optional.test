@@ -388,7 +388,7 @@ def lookup_field(name, obj):
         attr = None
 
 [case testTernaryWithNone]
-reveal_type(None if bool() else 0)  # N: Revealed type is 'Union[builtins.int, None]'
+reveal_type(None if bool() else 0)  # N: Revealed type is 'Union[Literal[0]?, None]'
 [builtins fixtures/bool.pyi]
 
 [case testListWithNone]
@@ -409,6 +409,8 @@ from typing import Optional
 x = None  # type: Optional[int]
 x + 1
 
+[builtins fixtures/primitives.pyi]
+
 [case testOptionalWhitelistPermitsOtherErrors]
 # flags: --strict-optional-whitelist
 import a
@@ -423,6 +425,7 @@ from typing import Optional
 x = None  # type: Optional[int]
 x + 1
 1 + "foo"
+[builtins fixtures/primitives.pyi]
 [out]
 tmp/b.py:4: error: Unsupported operand types for + ("int" and "str")
 
@@ -439,6 +442,7 @@ x + "foo"
 from typing import Optional
 x = None  # type: Optional[int]
 x + 1
+[builtins fixtures/primitives.pyi]
 [out]
 tmp/a.py:3: error: Unsupported left operand type for + ("None")
 tmp/a.py:3: note: Left operand is of type "Optional[str]"
@@ -522,6 +526,28 @@ if x == y:
     reveal_type(x)  # N: Revealed type is 'Union[builtins.str, builtins.int, None]'
 else:
     reveal_type(x)  # N: Revealed type is 'Union[builtins.str, builtins.int, None]'
+[builtins fixtures/ops.pyi]
+
+[case testInferEqualsNotOptionalWithMultipleArgs]
+from typing import Optional
+x: Optional[int]
+y: Optional[int]
+if x == y == 1:
+    reveal_type(x)  # N: Revealed type is 'builtins.int'
+    reveal_type(y)  # N: Revealed type is 'builtins.int'
+else:
+    reveal_type(x)  # N: Revealed type is 'Union[builtins.int, None]'
+    reveal_type(y)  # N: Revealed type is 'Union[builtins.int, None]'
+
+class A: pass
+a: Optional[A]
+b: Optional[A]
+if a == b == object():
+    reveal_type(a)  # N: Revealed type is '__main__.A'
+    reveal_type(b)  # N: Revealed type is '__main__.A'
+else:
+    reveal_type(a)  # N: Revealed type is 'Union[__main__.A, None]'
+    reveal_type(b)  # N: Revealed type is 'Union[__main__.A, None]'
 [builtins fixtures/ops.pyi]
 
 [case testWarnNoReturnWorksWithStrictOptional]

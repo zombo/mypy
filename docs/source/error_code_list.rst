@@ -83,7 +83,7 @@ definition in an active scope, such as an assignment, function
 definition or an import. This can catch missing definitions, missing
 imports, and typos.
 
-This example accidentally calls ``sort()`` instead of ``sorted()``:
+This example accidentally calls ``sort()`` instead of :py:func:`sorted`:
 
 .. code-block:: python
 
@@ -181,7 +181,7 @@ This example incorrectly uses the function ``log`` as a type:
        for x in objs:
            f(x)
 
-You can use ``Callable`` as the type for callable objects:
+You can use :py:data:`~typing.Callable` as the type for callable objects:
 
 .. code-block:: python
 
@@ -418,8 +418,8 @@ Example:
 Check TypedDict items [typeddict-item]
 --------------------------------------
 
-When constructing a TypedDict object, mypy checks that each key and value is compatible
-with the TypedDict type that is inferred from the surrounding context.
+When constructing a ``TypedDict`` object, mypy checks that each key and value is compatible
+with the ``TypedDict`` type that is inferred from the surrounding context.
 
 Example:
 
@@ -484,7 +484,7 @@ Example:
 
 .. code-block:: python
 
-    # Error: Cannot find module named 'acme'  [import]
+    # Error: Cannot find implementation or library stub for module named 'acme'  [import]
     import acme
 
 See :ref:`ignore-missing-imports` for how to work around these errors.
@@ -542,8 +542,7 @@ Check instantiation of abstract classes [abstract]
 
 Mypy generates an error if you try to instantiate an abstract base
 class (ABC). An abtract base class is a class with at least one
-abstract method or attribute. (See also `Python
-abc module documentation <https://docs.python.org/3/library/abc.html>`_.)
+abstract method or attribute. (See also :py:mod:`abc` module documentation)
 
 Sometimes a class is made accidentally abstract, often due to an
 unimplemented abstract method. In a case like this you need to provide
@@ -572,7 +571,7 @@ Example:
 Check the target of NewType [valid-newtype]
 -------------------------------------------
 
-The target of a ``NewType`` definition must be a class type. It can't
+The target of a :py:func:`NewType <typing.NewType>` definition must be a class type. It can't
 be a union type, ``Any``, or various other special types.
 
 You can also get this error if the target has been imported from a
@@ -592,6 +591,63 @@ treated by mypy as values with ``Any`` types. Example:
 To work around the issue, you can either give mypy access to the sources
 for ``acme`` or create a stub file for the module.  See :ref:`ignore-missing-imports`
 for more information.
+
+Check the return type of __exit__ [exit-return]
+-----------------------------------------------
+
+If mypy can determine that :py:meth:`__exit__ <object.__exit__>` always returns ``False``, mypy
+checks that the return type is *not* ``bool``.  The boolean value of
+the return type affects which lines mypy thinks are reachable after a
+``with`` statement, since any :py:meth:`__exit__ <object.__exit__>` method that can return
+``True`` may swallow exceptions. An imprecise return type can result
+in mysterious errors reported near ``with`` statements.
+
+To fix this, use either ``typing_extensions.Literal[False]`` or
+``None`` as the return type. Returning ``None`` is equivalent to
+returning ``False`` in this context, since both are treated as false
+values.
+
+Example:
+
+.. code-block:: python
+
+   class MyContext:
+       ...
+       def __exit__(self, exc, value, tb) -> bool:  # Error
+           print('exit')
+           return False
+
+This produces the following output from mypy:
+
+.. code-block:: text
+
+   example.py:3: error: "bool" is invalid as return type for "__exit__" that always returns False
+   example.py:3: note: Use "typing_extensions.Literal[False]" as the return type or change it to
+       "None"
+   example.py:3: note: If return type of "__exit__" implies that it may return True, the context
+       manager may swallow exceptions
+
+You can use ``Literal[False]`` to fix the error:
+
+.. code-block:: python
+
+   from typing_extensions import Literal
+
+   class MyContext:
+       ...
+       def __exit__(self, exc, value, tb) -> Literal[False]:  # OK
+           print('exit')
+           return False
+
+You can also use ``None``:
+
+.. code-block:: python
+
+   class MyContext:
+       ...
+       def __exit__(self, exc, value, tb) -> None:  # Also OK
+           print('exit')
+
 
 Report syntax errors [syntax]
 -----------------------------

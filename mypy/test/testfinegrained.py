@@ -281,11 +281,15 @@ class FineGrainedSuite(DataSuite):
             try_text = '--try-text' in flags
             m = re.match('--flex-any=([0-9.]+)', flags)
             flex_any = float(m.group(1)) if m else None
+            m = re.match(r'--use-fixme=(\w+)', flags)
+            use_fixme = m.group(1) if m else None
+            m = re.match('--max-guesses=([0-9]+)', flags)
+            max_guesses = int(m.group(1)) if m else None
             res = cast(Dict[str, Any],
                        server.cmd_suggest(
                            target.strip(), json=json, no_any=no_any, no_errors=no_errors,
-                           try_text=try_text, flex_any=flex_any,
-                           callsites=callsites))
+                           try_text=try_text, flex_any=flex_any, use_fixme=use_fixme,
+                           callsites=callsites, max_guesses=max_guesses))
             val = res['error'] if 'error' in res else res['out'] + res['err']
             if json:
                 # JSON contains already escaped \ on Windows, so requires a bit of care.

@@ -16,6 +16,7 @@ class int:
     # Note: this is a simplification of the actual signature
     def __init__(self, x: object = ..., base: int = ...) -> None: pass
     def __add__(self, i: int) -> int: pass
+    def __rmul__(self, x: int) -> int: pass
 class float:
     def __float__(self) -> float: pass
 class complex: pass
@@ -31,6 +32,11 @@ class bytes(Sequence[int]):
     def __contains__(self, other: object) -> bool: pass
     def __getitem__(self, item: int) -> int: pass
 class bytearray(Sequence[int]):
+    def __init__(self, x: bytes) -> None: pass
+    def __iter__(self) -> Iterator[int]: pass
+    def __contains__(self, other: object) -> bool: pass
+    def __getitem__(self, item: int) -> int: pass
+class memoryview(Sequence[int]):
     def __init__(self, x: bytes) -> None: pass
     def __iter__(self) -> Iterator[int]: pass
     def __contains__(self, other: object) -> bool: pass

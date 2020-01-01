@@ -3300,6 +3300,10 @@ class BoxedThing:
 class Subclass2(BoxedThing):
     pass
 
+class UsesNotImplemented:
+    def __eq__(self, b: object) -> bool:
+        return NotImplemented
+
 def index_into(x : Any, y : Any) -> Any:
     return x[y]
 
@@ -3344,6 +3348,8 @@ assert is_truthy(Item(''))
 assert is_truthy(Item('a'))
 assert not is_truthy(Subclass1(''))
 assert is_truthy(Subclass1('a'))
+
+assert UsesNotImplemented() != object()
 
 internal_index_into()
 [out]
@@ -3986,8 +3992,12 @@ started
 index
 
 [case testDecoratorsMethods]
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 from contextlib import contextmanager
+
+T = TypeVar('T')
+def dec(f: T) -> T:
+    return f
 
 def a(f: Callable[[Any], None]) -> Callable[[Any], None]:
     def g(a: Any) -> None:
@@ -4008,6 +4018,22 @@ class A:
             yield 0
         finally:
             print('contextmanager: exited')
+
+class Lol:
+    @staticmethod
+    def foo() -> None:
+        Lol.bar()
+        Lol.baz()
+
+    @staticmethod
+    @dec
+    def bar() -> None:
+        pass
+
+    @classmethod
+    @dec
+    def baz(cls) -> None:
+        pass
 
 def inside() -> None:
     with A().generator() as g:
@@ -4345,6 +4371,9 @@ class C:
     def foo(self) -> None:
         def bar(self) -> None:
             pass
+
+def C___foo() -> None: pass
+
 class D:
     def foo(self) -> None:
         def bar(self) -> None:

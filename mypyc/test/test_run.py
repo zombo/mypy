@@ -1,28 +1,33 @@
 """Test cases for building an C extension and running it."""
 
+import ast
 import glob
 import os.path
 import platform
+import re
 import subprocess
 import contextlib
 import shutil
 import sys
-from typing import Any, Iterator, Optional, List, cast
+from typing import Any, Iterator, List, cast
 
 from mypy import build
-from mypy.test.data import DataDrivenTestCase
+from mypy.test.data import DataDrivenTestCase, UpdateFile
 from mypy.test.config import test_temp_dir
 from mypy.errors import CompileError
 from mypy.options import Options
+from mypy.test.helpers import copy_and_fudge_mtime, assert_module_equivalence
 
 from mypyc import emitmodule
 from mypyc.options import CompilerOptions
-from mypyc.build import shared_lib_name
+from mypyc.errors import Errors
+from mypyc.build import construct_groups
 from mypyc.test.testutil import (
     ICODE_GEN_BUILTINS, TESTUTIL_PATH,
     use_custom_builtins, MypycDataSuite, assert_test_output,
-    show_c
+    show_c, fudge_dir_mtimes,
 )
+from mypyc.test.test_serialization import check_serialization_roundtrip
 
 files = [
     'run-functions.test',
@@ -35,13 +40,16 @@ files = [
 ]
 
 setup_format = """\
-from distutils.core import setup
+from setuptools import setup
 from mypyc.build import mypycify
 
 setup(name='test_run_output',
-      ext_modules=mypycify({}, skip_cgen=True, strip_asserts=False),
+      ext_modules=mypycify({}, separate={}, skip_cgen_input={!r}, strip_asserts=False,
+                           multi_file={}),
 )
 """
+
+WORKDIR = 'build'
 
 
 def run_setup(script_name: str, script_args: List[str]) -> bool:
@@ -97,148 +105,227 @@ class TestRun(MypycDataSuite):
     base_path = test_temp_dir
     optional_out = True
     multi_file = False
+    separate = False
 
     def run_case(self, testcase: DataDrivenTestCase) -> None:
-        bench = testcase.config.getoption('--bench', False) and 'Benchmark' in testcase.name
-
         # setup.py wants to be run from the root directory of the package, which we accommodate
         # by chdiring into tmp/
         with use_custom_builtins(os.path.join(self.data_prefix, ICODE_GEN_BUILTINS), testcase), (
                 chdir_manager('tmp')):
-            text = '\n'.join(testcase.input)
+            self.run_case_inner(testcase)
 
-            options = Options()
-            options.use_builtins_fixtures = True
-            options.show_traceback = True
-            options.strict_optional = True
-            # N.B: We try to (and ought to!) run with the current
-            # version of python, since we are going to link and run
-            # against the current version of python.
-            # But a lot of the tests use type annotations so we can't say it is 3.5.
-            options.python_version = max(sys.version_info[:2], (3, 6))
-            options.export_types = True
-            options.preserve_asts = True
+    def run_case_inner(self, testcase: DataDrivenTestCase) -> None:
+        os.mkdir(WORKDIR)
 
-            # Avoid checking modules/packages named 'unchecked', to provide a way
-            # to test interacting with code we don't have types for.
-            options.per_module_options['unchecked.*'] = {'follow_imports': 'error'}
+        text = '\n'.join(testcase.input)
 
-            workdir = 'build'
-            os.mkdir(workdir)
+        with open('native.py', 'w', encoding='utf-8') as f:
+            f.write(text)
+        with open('interpreted.py', 'w', encoding='utf-8') as f:
+            f.write(text)
 
-            source_path = 'native.py'
-            with open(source_path, 'w', encoding='utf-8') as f:
-                f.write(text)
-            with open('interpreted.py', 'w', encoding='utf-8') as f:
-                f.write(text)
+        shutil.copyfile(TESTUTIL_PATH, 'testutil.py')
 
-            shutil.copyfile(TESTUTIL_PATH, 'testutil.py')
+        step = 1
+        self.run_case_step(testcase, step)
 
-            source = build.BuildSource(source_path, 'native', text)
-            sources = [source]
-            module_names = ['native']
-            module_paths = [os.path.abspath('native.py')]
+        steps = testcase.find_steps()
+        if steps == [[]]:
+            steps = []
 
-            # Hard code another module name to compile in the same compilation unit.
-            to_delete = []
-            for fn, text in testcase.files:
-                fn = os.path.relpath(fn, test_temp_dir)
+        for operations in steps:
+            # To make sure that any new changes get picked up as being
+            # new by distutils, shift the mtime of all of the
+            # generated artifacts back by a second.
+            fudge_dir_mtimes(WORKDIR, -1)
 
-                if os.path.basename(fn).startswith('other'):
-                    name = os.path.basename(fn).split('.')[0]
-                    module_names.append(name)
-                    sources.append(build.BuildSource(fn, name, text))
-                    to_delete.append(fn)
-                    module_paths.append(os.path.abspath(fn))
+            step += 1
+            with chdir_manager('..'):
+                for op in operations:
+                    if isinstance(op, UpdateFile):
+                        # Modify/create file
+                        copy_and_fudge_mtime(op.source_path, op.target_path)
+                    else:
+                        # Delete file
+                        try:
+                            os.remove(op.path)
+                        except FileNotFoundError:
+                            pass
+            self.run_case_step(testcase, step)
 
-                    shutil.copyfile(fn,
-                                    os.path.join(os.path.dirname(fn), name + '_interpreted.py'))
+    def run_case_step(self, testcase: DataDrivenTestCase, incremental_step: int) -> None:
+        bench = testcase.config.getoption('--bench', False) and 'Benchmark' in testcase.name
 
-            for source in sources:
-                options.per_module_options.setdefault(source.module, {})['mypyc'] = True
+        options = Options()
+        options.use_builtins_fixtures = True
+        options.show_traceback = True
+        options.strict_optional = True
+        # N.B: We try to (and ought to!) run with the current
+        # version of python, since we are going to link and run
+        # against the current version of python.
+        # But a lot of the tests use type annotations so we can't say it is 3.5.
+        options.python_version = max(sys.version_info[:2], (3, 6))
+        options.export_types = True
+        options.preserve_asts = True
+        options.incremental = self.separate
 
-            if len(module_names) == 1:
-                lib_name = None  # type: Optional[str]
-            else:
-                lib_name = shared_lib_name([source.module for source in sources])
+        # Avoid checking modules/packages named 'unchecked', to provide a way
+        # to test interacting with code we don't have types for.
+        options.per_module_options['unchecked.*'] = {'follow_imports': 'error'}
 
-            try:
-                result = emitmodule.parse_and_typecheck(
-                    sources=sources,
-                    options=options,
-                    alt_lib_path='.')
-                cfiles = emitmodule.compile_modules_to_c(
-                    result,
-                    module_names=module_names,
-                    shared_lib_name=lib_name,
-                    compiler_options=CompilerOptions(multi_file=self.multi_file))
-            except CompileError as e:
-                for line in e.messages:
-                    print(line)
-                assert False, 'Compile error'
+        source = build.BuildSource('native.py', 'native', None)
+        sources = [source]
+        module_names = ['native']
+        module_paths = ['native.py']
 
-            for cfile, ctext in cfiles:
-                with open(os.path.join(workdir, cfile), 'w', encoding='utf-8') as f:
-                    f.write(ctext)
+        # Hard code another module name to compile in the same compilation unit.
+        to_delete = []
+        for fn, text in testcase.files:
+            fn = os.path.relpath(fn, test_temp_dir)
 
-            setup_file = os.path.abspath(os.path.join(workdir, 'setup.py'))
-            with open(setup_file, 'w') as f:
-                f.write(setup_format.format(module_paths))
+            if os.path.basename(fn).startswith('other') and fn.endswith('.py'):
+                name = fn.split('.')[0].replace(os.sep, '.')
+                module_names.append(name)
+                sources.append(build.BuildSource(fn, name, None))
+                to_delete.append(fn)
+                module_paths.append(fn)
 
-            if not run_setup(setup_file, ['build_ext', '--inplace']):
-                if testcase.config.getoption('--mypyc-showc'):
-                    show_c(cfiles)
-                assert False, "Compilation failed"
+                shutil.copyfile(fn,
+                                os.path.join(os.path.dirname(fn), name + '_interpreted.py'))
 
-            # Assert that an output file got created
-            suffix = 'pyd' if sys.platform == 'win32' else 'so'
-            assert glob.glob('native.*.{}'.format(suffix))
+        for source in sources:
+            options.per_module_options.setdefault(source.module, {})['mypyc'] = True
 
-            for p in to_delete:
-                os.remove(p)
+        separate = (self.get_separate('\n'.join(testcase.input), incremental_step) if self.separate
+                    else False)
 
-            driver_path = 'driver.py'
-            env = os.environ.copy()
-            env['MYPYC_RUN_BENCH'] = '1' if bench else '0'
+        groups = construct_groups(sources, separate, len(module_names) > 1)
 
-            # XXX: This is an ugly hack.
-            if 'MYPYC_RUN_GDB' in os.environ:
-                if platform.system() == 'Darwin':
-                    subprocess.check_call(['lldb', '--', sys.executable, driver_path], env=env)
-                    assert False, ("Test can't pass in lldb mode. (And remember to pass -s to "
-                                   "pytest)")
-                elif platform.system() == 'Linux':
-                    subprocess.check_call(['gdb', '--args', sys.executable, driver_path], env=env)
-                    assert False, ("Test can't pass in gdb mode. (And remember to pass -s to "
-                                   "pytest)")
-                else:
-                    assert False, 'Unsupported OS'
+        try:
+            compiler_options = CompilerOptions(multi_file=self.multi_file, separate=self.separate)
+            result = emitmodule.parse_and_typecheck(
+                sources=sources,
+                options=options,
+                compiler_options=compiler_options,
+                groups=groups,
+                alt_lib_path='.')
+            errors = Errors()
+            ir, cfiles = emitmodule.compile_modules_to_c(
+                result,
+                compiler_options=compiler_options,
+                errors=errors,
+                groups=groups,
+            )
+            if errors.num_errors:
+                errors.flush_errors()
+                assert False, "Compile error"
+        except CompileError as e:
+            for line in e.messages:
+                print(line)
+            assert False, 'Compile error'
 
-            proc = subprocess.Popen([sys.executable, driver_path], stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, env=env)
-            output = proc.communicate()[0].decode('utf8')
-            outlines = output.splitlines()
+        # Check that serialization works on this IR. (Only on the first
+        # step because the the returned ir only includes updated code.)
+        if incremental_step == 1:
+            check_serialization_roundtrip(ir)
 
+        setup_file = os.path.abspath(os.path.join(WORKDIR, 'setup.py'))
+        # We pass the C file information to the build script via setup.py unfortunately
+        with open(setup_file, 'w', encoding='utf-8') as f:
+            f.write(setup_format.format(module_paths, separate, cfiles, self.multi_file))
+
+        if not run_setup(setup_file, ['build_ext', '--inplace']):
             if testcase.config.getoption('--mypyc-showc'):
                 show_c(cfiles)
-            if proc.returncode != 0:
-                print()
-                print('*** Exit status: %d' % proc.returncode)
+            assert False, "Compilation failed"
 
-            # Verify output.
-            if bench:
-                print('Test output:')
-                print(output)
+        # Assert that an output file got created
+        suffix = 'pyd' if sys.platform == 'win32' else 'so'
+        assert glob.glob('native.*.{}'.format(suffix))
+
+        driver_path = 'driver.py'
+        env = os.environ.copy()
+        env['MYPYC_RUN_BENCH'] = '1' if bench else '0'
+
+        # XXX: This is an ugly hack.
+        if 'MYPYC_RUN_GDB' in os.environ:
+            if platform.system() == 'Darwin':
+                subprocess.check_call(['lldb', '--', sys.executable, driver_path], env=env)
+                assert False, ("Test can't pass in lldb mode. (And remember to pass -s to "
+                               "pytest)")
+            elif platform.system() == 'Linux':
+                subprocess.check_call(['gdb', '--args', sys.executable, driver_path], env=env)
+                assert False, ("Test can't pass in gdb mode. (And remember to pass -s to "
+                               "pytest)")
             else:
-                assert_test_output(testcase, outlines, 'Invalid output')
+                assert False, 'Unsupported OS'
 
-            assert proc.returncode == 0
+        proc = subprocess.Popen([sys.executable, driver_path], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, env=env)
+        output = proc.communicate()[0].decode('utf8')
+        outlines = output.splitlines()
+
+        if testcase.config.getoption('--mypyc-showc'):
+            show_c(cfiles)
+        if proc.returncode != 0:
+            print()
+            print('*** Exit status: %d' % proc.returncode)
+
+        # Verify output.
+        if bench:
+            print('Test output:')
+            print(output)
+        else:
+            if incremental_step == 1:
+                msg = 'Invalid output'
+                expected = testcase.output
+            else:
+                msg = 'Invalid output (step {})'.format(incremental_step)
+                expected = testcase.output2.get(incremental_step, [])
+
+            assert_test_output(testcase, outlines, msg, expected)
+
+        if incremental_step > 1 and options.incremental:
+            suffix = '' if incremental_step == 2 else str(incremental_step - 1)
+            expected_rechecked = testcase.expected_rechecked_modules.get(incremental_step - 1)
+            if expected_rechecked is not None:
+                assert_module_equivalence(
+                    'rechecked' + suffix,
+                    expected_rechecked, result.manager.rechecked_modules)
+            expected_stale = testcase.expected_stale_modules.get(incremental_step - 1)
+            if expected_stale is not None:
+                assert_module_equivalence(
+                    'stale' + suffix,
+                    expected_stale, result.manager.stale_modules)
+
+        assert proc.returncode == 0
+
+    def get_separate(self, program_text: str,
+                     incremental_step: int) -> Any:
+        template = r'# separate{}: (\[.*\])$'
+        m = re.search(template.format(incremental_step), program_text, flags=re.MULTILINE)
+        if not m:
+            m = re.search(template.format(''), program_text, flags=re.MULTILINE)
+        if m:
+            return ast.literal_eval(m.group(1))
+        else:
+            return True
 
 
 # Run the main multi-module tests in multi-file compliation mode
 class TestRunMultiFile(TestRun):
     multi_file = True
     test_name_suffix = '_multi'
+    files = [
+        'run-multimodule.test',
+        'run-mypy-sim.test',
+    ]
+
+
+# Run the main multi-module tests in separate compliation mode
+class TestRunSeparate(TestRun):
+    separate = True
+    test_name_suffix = '_separate'
     files = [
         'run-multimodule.test',
         'run-mypy-sim.test',

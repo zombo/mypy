@@ -21,8 +21,6 @@ semantics. This means (among some other things):
 
  * Instance attributes won't fall back to class attributes if undefined
 
- * Metaclasses not supported
-
  * Also there are still a bunch of bad bugs and unsupported features :)
 
 Compiled modules can import arbitrary Python modules, and compiled modules
@@ -114,16 +112,15 @@ These are the current planned major milestones:
 
 6. [DONE] Release a version of mypy that includes a compiled mypy.
 
-7a. More feature/compatibility work. (100% compatibility with Python is distinctly
-    an anti-goal, but more than we have now is a good idea.)
-
-7b. Support compiling Black, which is a prominent tool that could benefit
-    and has maintainer buy-in.
-    (Let us know if you maintain another Python tool or library and are
-     interested in working with us on this!)
-
-7c. More optimization! Code size reductions in particular are likely to
-    be valuable and will speed up mypyc compilation.
+7.
+    1. More feature/compatibility work. (100% compatibility with Python is distinctly
+       an anti-goal, but more than we have now is a good idea.)
+    2. [DONE] Support compiling Black, which is a prominent tool that could benefit
+       and has maintainer buy-in.
+       (Let us know if you maintain another Python tool or library and are
+       interested in working with us on this!)
+    3. More optimization! Code size reductions in particular are likely to
+       be valuable and will speed up mypyc compilation.
 
 8.  We'll see! Adventure is out there!
 

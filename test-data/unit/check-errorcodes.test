@@ -28,7 +28,7 @@ class A:
         pass
 
 [case testErrorCodeNoteHasNoCode]
-reveal_type(1) # N: Revealed type is 'builtins.int'
+reveal_type(1) # N: Revealed type is 'Literal[1]?'
 
 [case testErrorCodeSyntaxError]
 1 '' # E: invalid syntax  [syntax]
@@ -362,7 +362,7 @@ async def asyncf():  # E: Function is missing a return type annotation  [no-unty
 
 async def asyncf2(x: int):  # E: Function is missing a return type annotation  [no-untyped-def]
     return 0
-[typing fixtures/typing-full.pyi]
+[typing fixtures/typing-async.pyi]
 
 [case testErrorCodeCallUntypedFunction]
 # flags: --disallow-untyped-calls
@@ -495,12 +495,12 @@ if int() is str():  # E: Non-overlapping identity check (left operand type: "int
 [case testErrorCodeMissingModule]
 from defusedxml import xyz  # E: No library stub file for module 'defusedxml'  [import] \
                             # N: (Stub files are from https://github.com/python/typeshed)
-from nonexistent import foobar  # E: Cannot find module named 'nonexistent'  [import] \
+from nonexistent import foobar  # E: Cannot find implementation or library stub for module named 'nonexistent'  [import] \
     # N: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
-import nonexistent2  # E: Cannot find module named 'nonexistent2'  [import]
-from nonexistent3 import *  # E: Cannot find module named 'nonexistent3'  [import]
+import nonexistent2  # E: Cannot find implementation or library stub for module named 'nonexistent2'  [import]
+from nonexistent3 import *  # E: Cannot find implementation or library stub for module named 'nonexistent3'  [import]
 from pkg import bad  # E: Module 'pkg' has no attribute 'bad'  [attr-defined]
-from pkg.bad2 import bad3  # E: Cannot find module named 'pkg.bad2'  [import]
+from pkg.bad2 import bad3  # E: Cannot find implementation or library stub for module named 'pkg.bad2'  [import]
 [file pkg/__init__.py]
 
 [case testErrorCodeAlreadyDefined]
@@ -615,6 +615,7 @@ def g() -> int:
 '{}'.format(b'abc')  # E: On Python 3 '{}'.format(b'abc') produces "b'abc'"; use !r if this is a desired behavior  [str-bytes-safe]
 '%s' % b'abc'  # E: On Python 3 '%s' % b'abc' produces "b'abc'"; use %r if this is a desired behavior  [str-bytes-safe]
 [builtins fixtures/primitives.pyi]
+[typing fixtures/typing-medium.pyi]
 
 [case testErrorCodeIgnoreNamedDefinedNote]
 x: List[int]  # type: ignore[name-defined]
@@ -695,3 +696,37 @@ x = y  # type: int  # type: ignored [foo]
 [out]
 main:1: error: syntax error in type comment 'int'  [syntax]
 main:2: error: syntax error in type comment 'int'  [syntax]
+
+[case testErrorCode__exit__Return]
+class InvalidReturn:
+    def __exit__(self, x, y, z) -> bool:  # E: "bool" is invalid as return type for "__exit__" that always returns False  [exit-return] \
+# N: Use "typing_extensions.Literal[False]" as the return type or change it to "None" \
+# N: If return type of "__exit__" implies that it may return True, the context manager may swallow exceptions
+        return False
+[builtins fixtures/bool.pyi]
+
+[case testErrorCodeOverloadedOperatorMethod]
+# flags: --strict-optional
+from typing import Optional, overload
+
+class A:
+    @overload
+    def __add__(self, x: int) -> A: ...
+    @overload
+    def __add__(self, x: str) -> str: ...
+    def __add__(self, x): pass
+
+class B:
+    pass
+
+x: Optional[B]
+A() + x  # type: ignore[operator]
+
+class C:
+    @overload
+    def __rsub__(self, x: int) -> A: ...
+    @overload
+    def __rsub__(self, x: str) -> str: ...
+    def __rsub__(self, x): pass
+
+x - C()  # type: ignore[operator]

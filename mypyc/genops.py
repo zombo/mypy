@@ -14,7 +14,7 @@ It would be translated to something that conceptually looks like this:
    return r3
 """
 from typing import (
-    TypeVar, Callable, Dict, List, Tuple, Optional, Union, Sequence, Set, Any, cast
+    TypeVar, Callable, Dict, List, Tuple, Optional, Union, Sequence, Set, Any, Iterable, cast
 )
 from typing_extensions import overload, NoReturn
 from collections import OrderedDict
@@ -37,8 +37,6 @@ from mypy.nodes import (
     TypeVarExpr, TypedDictExpr, UnicodeExpr, WithStmt, YieldFromExpr, YieldExpr, GDEF, ARG_POS,
     ARG_OPT, ARG_NAMED, ARG_NAMED_OPT, ARG_STAR, ARG_STAR2, is_class_var, op_methods
 )
-import mypy.nodes
-import mypy.errors
 from mypy.types import (
     Type, Instance, CallableType, NoneTyp, TupleType, UnionType, AnyType, TypeVarType, PartialType,
     TypeType, Overloaded, TypeOfAny, UninhabitedType, UnboundType, TypedDictType,
@@ -48,6 +46,7 @@ from mypy.types import (
 from mypy.visitor import ExpressionVisitor, StatementVisitor
 from mypy.checkexpr import map_actuals_to_formals
 from mypy.state import strict_optional_set
+from mypy.util import split_target
 
 from mypyc.common import (
     ENV_ATTR_NAME, NEXT_LABEL_ATTR_NAME, TEMP_ATTR_NAME, LAMBDA_NAME,
@@ -59,16 +58,18 @@ from mypyc.ops import (
     BasicBlock, AssignmentTarget, AssignmentTargetRegister, AssignmentTargetIndex,
     AssignmentTargetAttr, AssignmentTargetTuple, Environment, Op, LoadInt, RType, Value, Register,
     Return, FuncIR, Assign, Branch, Goto, RuntimeArg, Call, Box, Unbox, Cast, RTuple, Unreachable,
-    TupleGet, TupleSet, ClassIR, NonExtClassInfo, RInstance, ModuleIR, GetAttr, SetAttr,
+    TupleGet, TupleSet, ClassIR, NonExtClassInfo, RInstance, ModuleIR, ModuleIRs, GetAttr, SetAttr,
     LoadStatic, InitStatic, MethodCall, INVALID_FUNC_DEF, int_rprimitive, float_rprimitive,
     bool_rprimitive, list_rprimitive, is_list_rprimitive, dict_rprimitive, set_rprimitive,
     str_rprimitive, tuple_rprimitive, none_rprimitive, is_none_rprimitive, object_rprimitive,
     exc_rtuple,
     PrimitiveOp, ControlOp, OpDescription, RegisterOp,
     is_object_rprimitive, LiteralsMap, FuncSignature, VTableAttr, VTableMethod, VTableEntries,
-    NAMESPACE_TYPE, RaiseStandardError, LoadErrorValue, NO_TRACEBACK_LINE_NO, FuncDecl,
+    NAMESPACE_TYPE, NAMESPACE_MODULE,
+    RaiseStandardError, LoadErrorValue, NO_TRACEBACK_LINE_NO, FuncDecl,
     FUNC_NORMAL, FUNC_STATICMETHOD, FUNC_CLASSMETHOD,
-    RUnion, is_optional_type, optional_value_type, all_concrete_classes
+    RUnion, is_optional_type, optional_value_type, all_concrete_classes,
+    DeserMaps,
 )
 from mypyc.ops_primitive import binary_ops, unary_ops, func_ops, method_ops, name_ref_ops
 from mypyc.ops_list import (
@@ -84,9 +85,10 @@ from mypyc.ops_misc import (
     check_stop_op, send_op, yield_from_except_op, coro_op,
     py_getattr_op, py_setattr_op, py_delattr_op, py_hasattr_op,
     py_call_op, py_call_with_kwargs_op, py_method_call_op,
-    fast_isinstance_op, bool_op, new_slice_op,
+    fast_isinstance_op, bool_op, new_slice_op, not_implemented_op,
     type_op, pytype_from_template_op, import_op, get_module_dict_op,
-    ellipsis_op, method_new_op, type_is_op, type_object_op, py_calc_meta_op
+    ellipsis_op, method_new_op, type_is_op, type_object_op, py_calc_meta_op,
+    dataclass_sleight_of_hand,
 )
 from mypyc.ops_exc import (
     raise_exception_op, raise_exception_with_tb_op, reraise_exception_op,
@@ -99,6 +101,7 @@ from mypyc.subtype import is_subtype
 from mypyc.sametype import is_same_type, is_same_method_signature
 from mypyc.crash import catch_errors
 from mypyc.options import CompilerOptions
+from mypyc.errors import Errors
 
 GenFunc = Callable[[], None]
 DictEntry = Tuple[Optional[Value], Value]
@@ -108,41 +111,19 @@ class UnsupportedException(Exception):
     pass
 
 
-class Errors:
-    def __init__(self) -> None:
-        self.num_errors = 0
-        self.num_warnings = 0
-        self._errors = mypy.errors.Errors()
-
-    def error(self, msg: str, path: str, line: int) -> None:
-        self._errors.report(line, None, msg, severity='error', file=path)
-        self.num_errors += 1
-
-    def warning(self, msg: str, path: str, line: int) -> None:
-        self._errors.report(line, None, msg, severity='warning', file=path)
-        self.num_warnings += 1
-
-    def flush_errors(self) -> None:
-        for error in self._errors.new_messages():
-            print(error)
-
-
 # The stubs for callable contextmanagers are busted so cast it to the
 # right type...
 F = TypeVar('F', bound=Callable[..., Any])
 strict_optional_dec = cast(Callable[[F], F], strict_optional_set(True))
 
 
-@strict_optional_dec  # Turn on strict optional for any type manipulations we do
-def build_ir(modules: List[MypyFile],
-             graph: Graph,
-             types: Dict[Expression, Type],
-             options: CompilerOptions) -> Tuple[LiteralsMap, List[Tuple[str, ModuleIR]], int]:
-    result = []
-    mapper = Mapper()
-    errors = Errors()
-
-    # Collect all classes defined in the compilation unit.
+def build_type_map(mapper: 'Mapper',
+                   modules: List[MypyFile],
+                   graph: Graph,
+                   types: Dict[Expression, Type],
+                   options: CompilerOptions,
+                   errors: Errors) -> None:
+    # Collect all classes defined in everything we are compiling
     classes = []
     for module in modules:
         module_classes = [node for node in module.defs if isinstance(node, ClassDef)]
@@ -151,36 +132,60 @@ def build_ir(modules: List[MypyFile],
     # Collect all class mappings so that we can bind arbitrary class name
     # references even if there are import cycles.
     for module, cdef in classes:
-        class_ir = ClassIR(cdef.name, module.fullname(), is_trait(cdef),
+        class_ir = ClassIR(cdef.name, module.fullname, is_trait(cdef),
                            is_abstract=cdef.info.is_abstract)
+        class_ir.is_ext_class = is_extension_class(cdef)
+        # If global optimizations are disabled, turn of tracking of class children
+        if not options.global_opts:
+            class_ir.children = None
         mapper.type_to_ir[cdef.info] = class_ir
-
-    # Figure out which classes need to be compiled as non-extension classes.
-    mark_non_ext_classes(mapper.type_to_ir)
 
     # Populate structural information in class IR for extension classes.
     for module, cdef in classes:
         with catch_errors(module.path, cdef.line):
             if mapper.type_to_ir[cdef.info].is_ext_class:
-                prepare_class_def(module.path, module.fullname(), cdef, errors, mapper)
+                prepare_class_def(module.path, module.fullname, cdef, errors, mapper)
             else:
-                prepare_non_ext_class_def(module.path, module.fullname(), cdef, errors, mapper)
+                prepare_non_ext_class_def(module.path, module.fullname, cdef, errors, mapper)
 
     # Collect all the functions also. We collect from the symbol table
     # so that we can easily pick out the right copy of a function that
     # is conditionally defined.
     for module in modules:
-        for name, node in module.names.items():
-            # We need to filter out functions that are imported or
-            # aliases.  The best way to do this seems to be by
-            # checking that the fullname matches.
-            if (isinstance(node.node, (FuncDef, Decorator, OverloadedFuncDef))
-                    and node.fullname == module.fullname() + '.' + name):
-                prepare_func_def(module.fullname(), None, get_func_def(node.node), mapper)
+        for func in get_module_func_defs(module):
+            prepare_func_def(module.fullname, None, func, mapper)
             # TODO: what else?
 
+
+def load_type_map(mapper: 'Mapper',
+                  modules: List[MypyFile],
+                  deser_ctx: DeserMaps) -> None:
+    """Populate a Mapper with deserialized IR from a list of modules."""
+    for module in modules:
+        for name, node in module.names.items():
+            if isinstance(node.node, TypeInfo):
+                ir = deser_ctx.classes[node.node.fullname]
+                mapper.type_to_ir[node.node] = ir
+                mapper.func_to_decl[node.node] = ir.ctor
+
+    for module in modules:
+        for func in get_module_func_defs(module):
+            mapper.func_to_decl[func] = deser_ctx.functions[func.fullname].decl
+
+
+@strict_optional_dec  # Turn on strict optional for any type manipulations we do
+def build_ir(modules: List[MypyFile],
+             graph: Graph,
+             types: Dict[Expression, Type],
+             mapper: 'Mapper',
+             options: CompilerOptions,
+             errors: Errors) -> ModuleIRs:
+
+    build_type_map(mapper, modules, graph, types, options, errors)
+
+    result = OrderedDict()  # type: ModuleIRs
+
     # Generate IR for all modules.
-    module_names = [mod.fullname() for mod in modules]
     class_irs = []
 
     for module in modules:
@@ -189,15 +194,18 @@ def build_ir(modules: List[MypyFile],
         module.accept(pbv)
 
         # Second pass.
-        builder = IRBuilder(types, graph, errors, mapper, module_names, pbv, options)
+        builder = IRBuilder(
+            module.fullname, types, graph, errors, mapper, pbv, options
+        )
         builder.visit_mypy_file(module)
         module_ir = ModuleIR(
+            module.fullname,
             list(builder.imports),
             builder.functions,
             builder.classes,
             builder.final_names
         )
-        result.append((module.fullname(), module_ir))
+        result[module.fullname] = module_ir
         class_irs.extend(builder.classes)
 
     # Compute vtables.
@@ -205,56 +213,86 @@ def build_ir(modules: List[MypyFile],
         if cir.is_ext_class:
             compute_vtable(cir)
 
-    errors.flush_errors()
-
-    return mapper.literals, result, errors.num_errors
+    return result
 
 
-def is_extension_class(cdef: ClassDef) -> bool:
-    if any(not (isinstance(d, RefExpr) and d.fullname == 'mypy_extensions.trait')
-           for d in cdef.decorators):
-        return False
-    elif (cdef.info.metaclass_type and cdef.info.metaclass_type.type.fullname() not in (
-            'abc.ABCMeta', 'typing.TypingMeta', 'typing.GenericMeta')):
-        return False
-    return True
-
-
-def mark_non_ext_classes(class_map: Dict[TypeInfo, ClassIR]) -> None:
-    """
-    Mark which classes should be compiled as non-extension classes.
-    Classes in the chain of base classes of a non-extension class
-    will all be marked as non-extension because currently
-    non-extension classes cannot inherit from extension classes.
-    """
-    visit_first = list(class_map.keys())
-    visit_second = []  # type: List[TypeInfo]
-    # First pass to gather all non-extension classes without
-    # considering base class chains
-    for typ in visit_first:
-        ir = class_map[typ]
-        ir.is_ext_class = is_extension_class(typ.defn)
-        if not ir.is_ext_class:
-            visit_second.append(typ)
-
-    # Second pass to propagate non-extension markings up the base class
-    # chains of classes marked as non-extension classes during the first pass.
-    for typ in visit_second:
-        todo = [typ]
-        while todo:
-            child = todo.pop()
-            for parent in child.bases:
-                if parent.type in class_map:
-                    parent_ir = class_map[parent.type]
-                    if not parent_ir.is_ext_class:
-                        continue
-                    parent_ir.is_ext_class = False
-                    todo.append(parent.type)
+def is_trait_decorator(d: Expression) -> bool:
+    return isinstance(d, RefExpr) and d.fullname == 'mypy_extensions.trait'
 
 
 def is_trait(cdef: ClassDef) -> bool:
-    return any(d.fullname == 'mypy_extensions.trait' for d in cdef.decorators
-               if isinstance(d, NameExpr))
+    return any(is_trait_decorator(d) for d in cdef.decorators)
+
+
+def is_dataclass_decorator(d: Expression) -> bool:
+    return (
+        (isinstance(d, RefExpr) and d.fullname == 'dataclasses.dataclass')
+        or (
+            isinstance(d, CallExpr)
+            and isinstance(d.callee, RefExpr)
+            and d.callee.fullname == 'dataclasses.dataclass'
+        )
+    )
+
+
+def is_dataclass(cdef: ClassDef) -> bool:
+    return any(is_dataclass_decorator(d) for d in cdef.decorators)
+
+
+def get_mypyc_attr_literal(e: Expression) -> Any:
+    """Convert an expression from a mypyc_attr decorator to a value.
+
+    Supports a pretty limited range."""
+    if isinstance(e, (StrExpr, IntExpr, FloatExpr)):
+        return e.value
+    elif isinstance(e, RefExpr) and e.fullname == 'builtins.True':
+        return True
+    elif isinstance(e, RefExpr) and e.fullname == 'builtins.False':
+        return False
+    elif isinstance(e, RefExpr) and e.fullname == 'builtins.None':
+        return None
+    return NotImplemented
+
+
+def get_mypyc_attr_call(d: Expression) -> Optional[CallExpr]:
+    """Check if an expression is a call to mypyc_attr and return it if so."""
+    if (
+        isinstance(d, CallExpr)
+        and isinstance(d.callee, RefExpr)
+        and d.callee.fullname == 'mypy_extensions.mypyc_attr'
+    ):
+        return d
+    return None
+
+
+def get_mypyc_attrs(stmt: Union[ClassDef, Decorator]) -> Dict[str, Any]:
+    """Collect all the mypyc_attr attributes on a class definition or a function."""
+    attrs = {}  # type: Dict[str, Any]
+    for dec in stmt.decorators:
+        d = get_mypyc_attr_call(dec)
+        if d:
+            for name, arg in zip(d.arg_names, d.args):
+                if name is None:
+                    if isinstance(arg, StrExpr):
+                        attrs[arg.value] = True
+                else:
+                    attrs[name] = get_mypyc_attr_literal(arg)
+
+    return attrs
+
+
+def is_extension_class(cdef: ClassDef) -> bool:
+    if any(
+        not is_trait_decorator(d)
+        and not is_dataclass_decorator(d)
+        and not get_mypyc_attr_call(d)
+        for d in cdef.decorators
+    ):
+        return False
+    elif (cdef.info.metaclass_type and cdef.info.metaclass_type.type.fullname not in (
+            'abc.ABCMeta', 'typing.TypingMeta', 'typing.GenericMeta')):
+        return False
+    return True
 
 
 def get_func_def(op: Union[FuncDef, Decorator, OverloadedFuncDef]) -> FuncDef:
@@ -264,6 +302,17 @@ def get_func_def(op: Union[FuncDef, Decorator, OverloadedFuncDef]) -> FuncDef:
     if isinstance(op, Decorator):
         op = op.func
     return op
+
+
+def get_module_func_defs(module: MypyFile) -> Iterable[FuncDef]:
+    """Collect all of the (non-method) functions declared in a module."""
+    for name, node in module.names.items():
+        # We need to filter out functions that are imported or
+        # aliases.  The best way to do this seems to be by
+        # checking that the fullname matches.
+        if (isinstance(node.node, (FuncDef, Decorator, OverloadedFuncDef))
+                and node.fullname == module.fullname + '.' + name):
+            yield get_func_def(node.node)
 
 
 def specialize_parent_vtable(cls: ClassIR, parent: ClassIR) -> VTableEntries:
@@ -281,10 +330,11 @@ def specialize_parent_vtable(cls: ClassIR, parent: ClassIR) -> VTableEntries:
                 # TODO: emit a wrapper for __init__ that raises or something
                 if (is_same_method_signature(orig_parent_method.sig, child_method.sig)
                         or orig_parent_method.name == '__init__'):
-                    entry = VTableMethod(entry.cls, entry.name, child_method)
+                    entry = VTableMethod(entry.cls, entry.name, child_method, entry.shadow_method)
                 else:
                     entry = VTableMethod(entry.cls, entry.name,
-                                         defining_cls.glue_methods[(entry.cls, entry.name)])
+                                         defining_cls.glue_methods[(entry.cls, entry.name)],
+                                         entry.shadow_method)
         else:
             # If it is an attribute from a trait, we need to find out
             # the real class it got mixed in at and point to that.
@@ -342,7 +392,10 @@ def compute_vtable(cls: ClassIR) -> None:
             # TODO: don't generate a new entry when we overload without changing the type
             if fn == cls.get_method(fn.name):
                 cls.vtable[fn.name] = len(entries)
-                entries.append(VTableMethod(t, fn.name, fn))
+                # If the class contains a glue method referring to itself, that is a
+                # shadow glue method to support interpreted subclasses.
+                shadow = cls.glue_methods.get((cls, fn.name))
+                entries.append(VTableMethod(t, fn.name, fn, shadow))
 
     # Compute vtables for all of the traits that the class implements
     if not cls.is_trait:
@@ -354,14 +407,20 @@ def compute_vtable(cls: ClassIR) -> None:
 class Mapper:
     """Keep track of mappings from mypy concepts to IR concepts.
 
-    This state is shared across all modules in a compilation unit.
+    This state is shared across all modules being compiled in all
+    compilation groups.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, group_map: Dict[str, Optional[str]]) -> None:
+        self.group_map = group_map
         self.type_to_ir = {}  # type: Dict[TypeInfo, ClassIR]
         self.func_to_decl = {}  # type: Dict[SymbolNode, FuncDecl]
-        # Maps integer, float, and unicode literals to a static name
-        self.literals = {}  # type: LiteralsMap
+        # LiteralsMap maps literal values to a static name. Each
+        # compilation group has its own LiteralsMap. (Since they can't
+        # share literals.)
+        self.literals = {
+            v: OrderedDict() for v in group_map.values()
+        }  # type: Dict[Optional[str], LiteralsMap]
 
     def type_to_rtype(self, typ: Optional[Type]) -> RType:
         if typ is None:
@@ -369,24 +428,24 @@ class Mapper:
 
         typ = get_proper_type(typ)
         if isinstance(typ, Instance):
-            if typ.type.fullname() == 'builtins.int':
+            if typ.type.fullname == 'builtins.int':
                 return int_rprimitive
-            elif typ.type.fullname() == 'builtins.float':
+            elif typ.type.fullname == 'builtins.float':
                 return float_rprimitive
-            elif typ.type.fullname() == 'builtins.str':
+            elif typ.type.fullname == 'builtins.str':
                 return str_rprimitive
-            elif typ.type.fullname() == 'builtins.bool':
+            elif typ.type.fullname == 'builtins.bool':
                 return bool_rprimitive
-            elif typ.type.fullname() == 'builtins.list':
+            elif typ.type.fullname == 'builtins.list':
                 return list_rprimitive
             # Dict subclasses are at least somewhat common and we
             # specifically support them, so make sure that dict operations
             # get optimized on them.
-            elif any(cls.fullname() == 'builtins.dict' for cls in typ.type.mro):
+            elif any(cls.fullname == 'builtins.dict' for cls in typ.type.mro):
                 return dict_rprimitive
-            elif typ.type.fullname() == 'builtins.set':
+            elif typ.type.fullname == 'builtins.set':
                 return set_rprimitive
-            elif typ.type.fullname() == 'builtins.tuple':
+            elif typ.type.fullname == 'builtins.tuple':
                 return tuple_rprimitive  # Varying-length tuple
             elif typ.type in self.type_to_ir:
                 return RInstance(self.type_to_ir[typ.type])
@@ -395,7 +454,7 @@ class Mapper:
         elif isinstance(typ, TupleType):
             # Use our unboxed tuples for raw tuples but fall back to
             # being boxed for NamedTuple.
-            if typ.partial_fallback.type.fullname() == 'builtins.tuple':
+            if typ.partial_fallback.type.fullname == 'builtins.tuple':
                 return RTuple([self.type_to_rtype(t) for t in typ.items])
             else:
                 return tuple_rprimitive
@@ -449,33 +508,38 @@ class Mapper:
             arg_types = [object_rprimitive for arg in fdef.arguments]
             ret = object_rprimitive
 
-        args = [RuntimeArg(arg.variable.name(), arg_type, arg.kind)
-                for arg, arg_type in zip(fdef.arguments, arg_types)]
+        args = [RuntimeArg(arg_name, arg_type, arg_kind)
+                for arg_name, arg_kind, arg_type in zip(fdef.arg_names, fdef.arg_kinds, arg_types)]
 
         # We force certain dunder methods to return objects to support letting them
         # return NotImplemented. It also avoids some pointless boxing and unboxing,
         # since tp_richcompare needs an object anyways.
-        if fdef.name() in ('__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__'):
+        if fdef.name in ('__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__'):
             ret = object_rprimitive
         return FuncSignature(args, ret)
 
-    def literal_static_name(self, value: Union[int, float, complex, str, bytes]) -> str:
+    def literal_static_name(self, module: str,
+                            value: Union[int, float, complex, str, bytes]) -> str:
+        # Literals are shared between modules in a compilation group
+        # but not outside the group.
+        literals = self.literals[self.group_map.get(module)]
+
         # Include type to distinguish between 1 and 1.0, and so on.
         key = (type(value), value)
-        if key not in self.literals:
+        if key not in literals:
             if isinstance(value, str):
                 prefix = 'unicode_'
             else:
                 prefix = type(value).__name__ + '_'
-            self.literals[key] = prefix + str(len(self.literals))
-        return self.literals[key]
+            literals[key] = prefix + str(len(literals))
+        return literals[key]
 
 
 def prepare_func_def(module_name: str, class_name: Optional[str],
                      fdef: FuncDef, mapper: Mapper) -> FuncDecl:
     kind = FUNC_STATICMETHOD if fdef.is_static else (
         FUNC_CLASSMETHOD if fdef.is_class else FUNC_NORMAL)
-    decl = FuncDecl(fdef.name(), class_name, module_name, mapper.fdef_to_sig(fdef), kind)
+    decl = FuncDecl(fdef.name, class_name, module_name, mapper.fdef_to_sig(fdef), kind)
     mapper.func_to_decl[fdef] = decl
     return decl
 
@@ -483,25 +547,25 @@ def prepare_func_def(module_name: str, class_name: Optional[str],
 def prepare_method_def(ir: ClassIR, module_name: str, cdef: ClassDef, mapper: Mapper,
                        node: Union[FuncDef, Decorator]) -> None:
     if isinstance(node, FuncDef):
-        ir.method_decls[node.name()] = prepare_func_def(module_name, cdef.name, node, mapper)
+        ir.method_decls[node.name] = prepare_func_def(module_name, cdef.name, node, mapper)
     elif isinstance(node, Decorator):
         # TODO: do something about abstract methods here. Currently, they are handled just like
         # normal methods.
         decl = prepare_func_def(module_name, cdef.name, node.func, mapper)
         if not node.decorators:
-            ir.method_decls[node.name()] = decl
+            ir.method_decls[node.name] = decl
         elif isinstance(node.decorators[0], MemberExpr) and node.decorators[0].name == 'setter':
             # Make property setter name different than getter name so there are no
             # name clashes when generating C code, and property lookup at the IR level
             # works correctly.
             decl.name = PROPSET_PREFIX + decl.name
             decl.is_prop_setter = True
-            ir.method_decls[PROPSET_PREFIX + node.name()] = decl
+            ir.method_decls[PROPSET_PREFIX + node.name] = decl
 
         if node.func.is_property:
             assert node.func.type
             decl.is_prop_getter = True
-            ir.property_types[node.name()] = decl.sig.ret_type
+            ir.property_types[node.name] = decl.sig.ret_type
 
 
 def is_valid_multipart_property_def(prop: OverloadedFuncDef) -> bool:
@@ -531,8 +595,16 @@ def prepare_class_def(path: str, module_name: str, cdef: ClassDef,
     ir = mapper.type_to_ir[cdef.info]
     info = cdef.info
 
+    attrs = get_mypyc_attrs(cdef)
+    if attrs.get("allow_interpreted_subclasses") is True:
+        ir.allow_interpreted_subclasses = True
+
     # We sort the table for determinism here on Python 3.5
     for name, node in sorted(info.names.items()):
+        # Currenly all plugin generated methods are dummies and not included.
+        if node.plugin_generated:
+            continue
+
         if isinstance(node.node, Var):
             assert node.node.type, "Class member %s missing type" % name
             if not node.node.is_classvar and name != '__slots__':
@@ -557,12 +629,12 @@ def prepare_class_def(path: str, module_name: str, cdef: ClassDef,
     for cls in info.mro:
         # Special case exceptions and dicts
         # XXX: How do we handle *other* things??
-        if cls.fullname() == 'builtins.BaseException':
+        if cls.fullname == 'builtins.BaseException':
             ir.builtin_base = 'PyBaseExceptionObject'
-        elif cls.fullname() == 'builtins.dict':
+        elif cls.fullname == 'builtins.dict':
             ir.builtin_base = 'PyDictObject'
-        elif cls.fullname().startswith('builtins.'):
-            if not can_subclass_builtin(cls.fullname()):
+        elif cls.fullname.startswith('builtins.'):
+            if not can_subclass_builtin(cls.fullname):
                 # Note that if we try to subclass a C extension class that
                 # isn't in builtins, bad things will happen and we won't
                 # catch it here! But this should catch a lot of the most
@@ -577,6 +649,20 @@ def prepare_class_def(path: str, module_name: str, cdef: ClassDef,
     init_node = cdef.info['__init__'].node
     if not ir.is_trait and not ir.builtin_base and isinstance(init_node, FuncDef):
         init_sig = mapper.fdef_to_sig(init_node)
+
+        defining_ir = mapper.type_to_ir.get(init_node.info)
+        # If there is a nontrivial __init__ that wasn't defined in an
+        # extension class, we need to make the constructor take *args,
+        # **kwargs so it can call tp_init.
+        if ((defining_ir is None or not defining_ir.is_ext_class
+             or cdef.info['__init__'].plugin_generated)
+                and init_node.info.fullname != 'builtins.object'):
+            init_sig = FuncSignature(
+                [init_sig.args[0],
+                 RuntimeArg("args", tuple_rprimitive, ARG_STAR),
+                 RuntimeArg("kwargs", dict_rprimitive, ARG_STAR2)],
+                init_sig.ret_type)
+
         ctor_sig = FuncSignature(init_sig.args[1:], RInstance(ir))
         ir.ctor = FuncDecl(cdef.name, None, module_name, ctor_sig)
         mapper.func_to_decl[cdef.info] = ir.ctor
@@ -592,7 +678,7 @@ def prepare_class_def(path: str, module_name: str, cdef: ClassDef,
     base_mro = []
     for cls in info.mro:
         if cls not in mapper.type_to_ir:
-            if cls.fullname() != 'builtins.object':
+            if cls.fullname != 'builtins.object':
                 ir.inherits_python = True
             continue
         base_ir = mapper.type_to_ir[cls]
@@ -606,13 +692,15 @@ def prepare_class_def(path: str, module_name: str, cdef: ClassDef,
     base_idx = 1 if not ir.is_trait else 0
     if len(base_mro) > base_idx:
         ir.base = base_mro[base_idx]
-    if not all(base_mro[i].base == base_mro[i + 1] for i in range(len(base_mro) - 1)):
-        errors.error("Non-trait MRO must be linear", path, cdef.line)
     ir.mro = mro
     ir.base_mro = base_mro
 
     for base in bases:
-        base.children.append(ir)
+        if base.children is not None:
+            base.children.append(ir)
+
+    if is_dataclass(cdef):
+        ir.is_augmented = True
 
 
 def prepare_non_ext_class_def(path: str, module_name: str, cdef: ClassDef,
@@ -627,12 +715,19 @@ def prepare_non_ext_class_def(path: str, module_name: str, cdef: ClassDef,
         elif isinstance(node.node, OverloadedFuncDef):
             # Handle case for property with both a getter and a setter
             if node.node.is_property:
-                errors.error("Non-extension classes do not support property setters",
-                             path, cdef.line)
+                if not is_valid_multipart_property_def(node.node):
+                    errors.error("Unsupported property decorator semantics", path, cdef.line)
+                for item in node.node.items:
+                    prepare_method_def(ir, module_name, cdef, mapper, item)
             # Handle case for regular function overload
             else:
-                errors.error("Non-extension classes do not support overlaoded functions",
-                             path, cdef.line)
+                prepare_method_def(ir, module_name, cdef, mapper, get_func_def(node.node))
+
+    if any(
+        cls in mapper.type_to_ir and mapper.type_to_ir[cls].is_ext_class for cls in info.mro
+    ):
+        errors.error(
+            "Non-extension classes may not inherit from extension classes", path, cdef.line)
 
 
 def concrete_arg_kind(kind: int) -> int:
@@ -996,13 +1091,14 @@ class FinallyNonlocalControl(CleanupNonlocalControl):
 
 class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
     def __init__(self,
+                 current_module: str,
                  types: Dict[Expression, Type],
                  graph: Graph,
                  errors: Errors,
                  mapper: Mapper,
-                 modules: List[str],
                  pbv: PreBuildVisitor,
                  options: CompilerOptions) -> None:
+        self.current_module = current_module
         self.types = types
         self.graph = graph
         self.environment = Environment()
@@ -1012,14 +1108,8 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         self.functions = []  # type: List[FuncIR]
         self.classes = []  # type: List[ClassIR]
         self.final_names = []  # type: List[Tuple[str, RType]]
-        self.modules = set(modules)
         self.callable_class_names = set()  # type: Set[str]
         self.options = options
-
-        # This instance of NonExtClassInfo keeps track of information needed to construct
-        # a non-extension class. Its' value is None if the current class being visited
-        # is an extension class.
-        self.non_ext_info = None  # type: Optional[NonExtClassInfo]
 
         # These variables keep track of the number of lambdas, implicit indices, and implicit
         # iterators instantiated so we avoid name conflicts. The indices and iterators are
@@ -1056,13 +1146,13 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         self.imports = OrderedDict()  # type: OrderedDict[str, None]
 
     def visit_mypy_file(self, mypyfile: MypyFile) -> None:
-        if mypyfile.fullname() in ('typing', 'abc'):
+        if mypyfile.fullname in ('typing', 'abc'):
             # These module are special; their contents are currently all
             # built-in primitives.
             return
 
         self.module_path = mypyfile.path
-        self.module_name = mypyfile.fullname()
+        self.module_name = mypyfile.fullname
 
         classes = [node for node in mypyfile.defs if isinstance(node, ClassDef)]
 
@@ -1090,14 +1180,14 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
 
     def handle_ext_method(self, cdef: ClassDef, fdef: FuncDef) -> None:
         # Perform the function of visit_method for methods inside extension classes.
-        name = fdef.name()
+        name = fdef.name
         class_ir = self.mapper.type_to_ir[cdef.info]
         func_ir, func_reg = self.gen_func_item(fdef, name, self.mapper.fdef_to_sig(fdef), cdef)
         self.functions.append(func_ir)
 
         if self.is_decorated(fdef):
             # Obtain the the function name in order to construct the name of the helper function.
-            _, _, name = fdef.fullname().rpartition('.')
+            _, _, name = fdef.fullname.rpartition('.')
             helper_name = decorator_helper_name(name)
             # Read the PyTypeObject representing the class, get the callable object
             # representing the non-decorated method
@@ -1124,35 +1214,36 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             getter_ir, _ = class_ir.properties[name]
             class_ir.properties[name] = (getter_ir, func_ir)
 
-        if func_ir.decl.is_prop_setter:
-            class_ir.methods[PROPSET_PREFIX + name] = func_ir
-        else:
-            class_ir.methods[name] = func_ir
+        class_ir.methods[func_ir.decl.name] = func_ir
 
         # If this overrides a parent class method with a different type, we need
         # to generate a glue method to mediate between them.
-        for cls in class_ir.mro[1:]:
-            if (name in cls.method_decls and name != '__init__'
+        for base in class_ir.mro[1:]:
+            if (name in base.method_decls and name != '__init__'
                     and not is_same_method_signature(class_ir.method_decls[name].sig,
-                                                     cls.method_decls[name].sig)):
+                                                     base.method_decls[name].sig)):
 
                 # TODO: Support contravariant subtyping in the input argument for
                 # property setters. Need to make a special glue method for handling this,
                 # similar to gen_glue_property.
 
-                if fdef.is_property:
-                    f = self.gen_glue_property(cls.method_decls[name].sig, func_ir, class_ir,
-                                               cls, fdef.line)
-                else:
-                    f = self.gen_glue_method(cls.method_decls[name].sig, func_ir, class_ir,
-                                             cls, fdef.line)
-
-                class_ir.glue_methods[(cls, name)] = f
+                f = self.gen_glue(base.method_decls[name].sig, func_ir, class_ir, base, fdef)
+                class_ir.glue_methods[(base, name)] = f
                 self.functions.append(f)
 
-    def handle_non_ext_method(self, cdef: ClassDef, fdef: FuncDef) -> None:
+        # If the class allows interpreted children, create glue
+        # methods that dispatch via the Python API. These will go in a
+        # "shadow vtable" that will be assigned to interpreted
+        # children.
+        if class_ir.allow_interpreted_subclasses:
+            f = self.gen_glue(func_ir.sig, func_ir, class_ir, class_ir, fdef, do_py_ops=True)
+            class_ir.glue_methods[(class_ir, name)] = f
+            self.functions.append(f)
+
+    def handle_non_ext_method(
+            self, non_ext: NonExtClassInfo, cdef: ClassDef, fdef: FuncDef) -> None:
         # Perform the function of visit_method for methods inside non-extension classes.
-        name = fdef.name()
+        name = fdef.name
         func_ir, func_reg = self.gen_func_item(fdef, name, self.mapper.fdef_to_sig(fdef), cdef)
         assert func_reg is not None
         self.functions.append(func_ir)
@@ -1175,14 +1266,14 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             stat_meth = self.load_module_attr_by_fullname('builtins.staticmethod', fdef.line)
             func_reg = self.py_call(stat_meth, [func_reg], fdef.line)
 
-        self.add_to_non_ext_dict(name, func_reg, fdef.line)
+        self.add_to_non_ext_dict(non_ext, name, func_reg, fdef.line)
 
-    def visit_method(self, cdef: ClassDef, fdef: FuncDef) -> None:
-        class_ir = self.mapper.type_to_ir[cdef.info]
-        if class_ir.is_ext_class:
-            self.handle_ext_method(cdef, fdef)
+    def visit_method(
+            self, cdef: ClassDef, non_ext: Optional[NonExtClassInfo], fdef: FuncDef) -> None:
+        if non_ext:
+            self.handle_non_ext_method(non_ext, cdef, fdef)
         else:
-            self.handle_non_ext_method(cdef, fdef)
+            self.handle_ext_method(cdef, fdef)
 
     def is_constant(self, e: Expression) -> bool:
         """Check whether we allow an expression to appear as a default value.
@@ -1220,6 +1311,10 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                         and not is_class_var(stmt.lvalues[0])
                         and not isinstance(stmt.rvalue, TempNode)):
                     if stmt.lvalues[0].name == '__slots__':
+                        continue
+
+                    # Skip type annotated assignments in dataclasses
+                    if is_dataclass(cdef) and stmt.type:
                         continue
 
                     default_assignments.append(stmt)
@@ -1260,27 +1355,28 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         self.functions.append(ir)
         cls.methods[ir.name] = ir
 
-    def load_non_ext_class(self, ir: ClassIR, line: int) -> Value:
-        assert self.non_ext_info is not None
-
-        cls_name = self.load_static_unicode(ir.name)
-
+    def finish_non_ext_dict(self, non_ext: NonExtClassInfo, line: int) -> None:
         # Add __annotations__ to the class dict.
         self.primitive_op(dict_set_item_op,
-                          [self.non_ext_info.dict, self.load_static_unicode('__annotations__'),
-                           self.non_ext_info.anns], -1)
+                          [non_ext.dict, self.load_static_unicode('__annotations__'),
+                           non_ext.anns], -1)
 
         # We add a __doc__ attribute so if the non-extension class is decorated with the
         # dataclass decorator, dataclass will not try to look for __text_signature__.
         # https://github.com/python/cpython/blob/3.7/Lib/dataclasses.py#L957
-        filler_doc_str = 'filler docstring for classes decorated with dataclass'
-        self.add_to_non_ext_dict('__doc__', self.load_static_unicode(filler_doc_str), line)
-        self.add_to_non_ext_dict('__module__', self.load_static_unicode(self.module_name), line)
-        metaclass = self.primitive_op(type_object_op, [], line)
-        metaclass = self.primitive_op(py_calc_meta_op, [metaclass, self.non_ext_info.bases], line)
+        filler_doc_str = 'mypyc filler docstring'
+        self.add_to_non_ext_dict(
+            non_ext, '__doc__', self.load_static_unicode(filler_doc_str), line)
+        self.add_to_non_ext_dict(
+            non_ext, '__module__', self.load_static_unicode(self.module_name), line)
 
-        class_type_obj = self.py_call(metaclass,
-                                      [cls_name, self.non_ext_info.bases, self.non_ext_info.dict],
+    def load_non_ext_class(self, ir: ClassIR, non_ext: NonExtClassInfo, line: int) -> Value:
+        cls_name = self.load_static_unicode(ir.name)
+
+        self.finish_non_ext_dict(non_ext, line)
+
+        class_type_obj = self.py_call(non_ext.metaclass,
+                                      [cls_name, non_ext.bases, non_ext.dict],
                                       line)
         return class_type_obj
 
@@ -1306,23 +1402,25 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         ir = self.mapper.type_to_ir[cdef.info]
         bases = []
         for cls in cdef.info.mro[1:]:
-            if cls.fullname() == 'builtins.object':
+            if cls.fullname == 'builtins.object':
                 continue
             # Add the current class to the base classes list of concrete subclasses
             if cls in self.mapper.type_to_ir:
-                self.mapper.type_to_ir[cls].children.append(ir)
+                base_ir = self.mapper.type_to_ir[cls]
+                if base_ir.children is not None:
+                    base_ir.children.append(ir)
 
-            base = self.load_global_str(cls.name(), cdef.line)
+            base = self.load_global_str(cls.name, cdef.line)
             bases.append(base)
         return self.primitive_op(new_tuple_op, bases, cdef.line)
 
-    def add_to_non_ext_dict(self, key: str, val: Value, line: int) -> None:
+    def add_to_non_ext_dict(self, non_ext: NonExtClassInfo,
+                            key: str, val: Value, line: int) -> None:
         # Add an attribute entry into the class dict of a non-extension class.
-        assert self.non_ext_info is not None
         key_unicode = self.load_static_unicode(key)
-        self.primitive_op(dict_set_item_op, [self.non_ext_info.dict, key_unicode, val], line)
+        self.primitive_op(dict_set_item_op, [non_ext.dict, key_unicode, val], line)
 
-    def add_non_ext_class_attr(self, lvalue: NameExpr,
+    def add_non_ext_class_attr(self, non_ext: NonExtClassInfo, lvalue: NameExpr,
                                stmt: AssignmentStmt, cdef: ClassDef,
                                attr_to_cache: List[Lvalue]) -> None:
         """
@@ -1333,31 +1431,41 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         # We populate __annotations__ because dataclasses uses it to determine
         # which attributes to compute on.
         # TODO: Maybe generate more precise types for annotations
-        assert self.non_ext_info is not None
         key = self.load_static_unicode(lvalue.name)
         typ = self.primitive_op(type_object_op, [], stmt.line)
-        self.primitive_op(dict_set_item_op, [self.non_ext_info.anns, key, typ], stmt.line)
+        self.primitive_op(dict_set_item_op, [non_ext.anns, key, typ], stmt.line)
 
         # Only add the attribute to the __dict__ if the assignment is of the form:
         # x: type = value (don't add attributes of the form 'x: type' to the __dict__).
         if not isinstance(stmt.rvalue, TempNode):
             rvalue = self.accept(stmt.rvalue)
-            self.add_to_non_ext_dict(lvalue.name, rvalue, stmt.line)
+            self.add_to_non_ext_dict(non_ext, lvalue.name, rvalue, stmt.line)
             # We cache enum attributes to speed up enum attribute lookup since they
             # are final.
-            if cdef.info.bases and cdef.info.bases[0].type.fullname() == 'enum.Enum':
+            if (
+                cdef.info.bases
+                and cdef.info.bases[0].type.fullname == 'enum.Enum'
+                # Skip "_order_" and "__order__", since Enum will remove it
+                and lvalue.name not in ('_order_', '__order__')
+            ):
                 attr_to_cache.append(lvalue)
 
-    def setup_non_ext_dict(self, cdef: ClassDef, bases: Value) -> Value:
+    def find_non_ext_metaclass(self, cdef: ClassDef, bases: Value) -> Value:
+        """Find the metaclass of a class from its defs and bases. """
+        if cdef.metaclass:
+            declared_metaclass = self.accept(cdef.metaclass)
+        else:
+            declared_metaclass = self.primitive_op(type_object_op, [], cdef.line)
+
+        return self.primitive_op(py_calc_meta_op, [declared_metaclass, bases], cdef.line)
+
+    def setup_non_ext_dict(self, cdef: ClassDef, metaclass: Value, bases: Value) -> Value:
         """
         Initialize the class dictionary for a non-extension class. This class dictionary
         is passed to the metaclass constructor.
         """
 
         # Check if the metaclass defines a __prepare__ method, and if so, call it.
-        metaclass = self.primitive_op(type_object_op, [], cdef.line)
-        metaclass = self.primitive_op(py_calc_meta_op, [metaclass, bases],
-                                      cdef.line)
         has_prepare = self.primitive_op(py_hasattr_op,
                                         [metaclass,
                                         self.load_static_unicode('__prepare__')], cdef.line)
@@ -1387,48 +1495,108 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         for lval in attrs_to_cache:
             assert isinstance(lval, NameExpr)
             rval = self.py_get_attr(typ, lval.name, cdef.line)
-            self.init_final_static(lval, rval, cdef.fullname)
+            self.init_final_static(lval, rval, cdef.name)
+
+    def dataclass_non_ext_info(self, cdef: ClassDef) -> Optional[NonExtClassInfo]:
+        """Set up a NonExtClassInfo to track dataclass attributes.
+
+        In addition to setting up a normal extension class for dataclasses,
+        we also collect its class attributes like a non-extension class so
+        that we can hand them to the dataclass decorator.
+        """
+        if is_dataclass(cdef):
+            return NonExtClassInfo(
+                self.primitive_op(new_dict_op, [], cdef.line),
+                self.add(TupleSet([], cdef.line)),
+                self.primitive_op(new_dict_op, [], cdef.line),
+                self.primitive_op(type_object_op, [], cdef.line),
+            )
+        else:
+            return None
+
+    def dataclass_finalize(
+            self, cdef: ClassDef, non_ext: NonExtClassInfo, type_obj: Value) -> None:
+        """Generate code to finish instantiating a dataclass.
+
+        This works by replacing all of the attributes on the class
+        (which will be descriptors) with whatever they would be in a
+        non-extension class, calling dataclass, then switching them back.
+
+        The resulting class is an extension class and instances of it do not
+        have a __dict__ (unless something else requires it).
+        All methods written explicitly in the source are compiled and
+        may be called through the vtable while the methods generated
+        by dataclasses are interpreted and may not be.
+
+        (If we just called dataclass without doing this, it would think that all
+        of the descriptors for our attributes are default values and generate an
+        incorrect constructor. We need to do the switch so that dataclass gets the
+        appropriate defaults.)
+        """
+        self.finish_non_ext_dict(non_ext, cdef.line)
+        dec = self.accept(next(d for d in cdef.decorators if is_dataclass_decorator(d)))
+        self.primitive_op(
+            dataclass_sleight_of_hand, [dec, type_obj, non_ext.dict, non_ext.anns], cdef.line)
 
     def visit_class_def(self, cdef: ClassDef) -> None:
         ir = self.mapper.type_to_ir[cdef.info]
+
+        # We do this check here because the base field of parent
+        # classes aren't necessarily populated yet at
+        # prepare_class_def time.
+        if any(ir.base_mro[i].base != ir. base_mro[i + 1] for i in range(len(ir.base_mro) - 1)):
+            self.error("Non-trait MRO must be linear", cdef.line)
+
+        if ir.allow_interpreted_subclasses:
+            for parent in ir.mro:
+                if not parent.allow_interpreted_subclasses:
+                    self.error(
+                        'Base class "{}" does not allow interpreted subclasses'.format(
+                            parent.fullname), cdef.line)
+
         # Currently, we only create non-extension classes for classes that are
         # decorated or inherit from Enum. Classes decorated with @trait do not
         # apply here, and are handled in a different way.
         if ir.is_ext_class:
             # If the class is not decorated, generate an extension class for it.
-            self.allocate_class(cdef)
+            type_obj = self.allocate_class(cdef)  # type: Optional[Value]
+            non_ext = None  # type: Optional[NonExtClassInfo]
+            dataclass_non_ext = self.dataclass_non_ext_info(cdef)
         else:
             non_ext_bases = self.populate_non_ext_bases(cdef)
-            non_ext_dict = self.setup_non_ext_dict(cdef, non_ext_bases)
+            non_ext_metaclass = self.find_non_ext_metaclass(cdef, non_ext_bases)
+            non_ext_dict = self.setup_non_ext_dict(cdef, non_ext_metaclass, non_ext_bases)
             # We populate __annotations__ for non-extension classes
             # because dataclasses uses it to determine which attributes to compute on.
             # TODO: Maybe generate more precise types for annotations
             non_ext_anns = self.primitive_op(new_dict_op, [], cdef.line)
-            self.non_ext_info = NonExtClassInfo(non_ext_dict, non_ext_bases, non_ext_anns)
+            non_ext = NonExtClassInfo(non_ext_dict, non_ext_bases, non_ext_anns, non_ext_metaclass)
+            dataclass_non_ext = None
+            type_obj = None
 
-            attrs_to_cache = []  # type: List[Lvalue]
+        attrs_to_cache = []  # type: List[Lvalue]
 
         for stmt in cdef.defs.body:
             if isinstance(stmt, OverloadedFuncDef) and stmt.is_property:
                 if not ir.is_ext_class:
                     # properties with both getters and setters in non_extension
                     # classes not supported
-                    self.error("Property setters not supported in non-exstension classes",
+                    self.error("Property setters not supported in non-extension classes",
                                stmt.line)
                 for item in stmt.items:
                     with self.catch_errors(stmt.line):
-                        self.visit_method(cdef, get_func_def(item))
+                        self.visit_method(cdef, non_ext, get_func_def(item))
             elif isinstance(stmt, (FuncDef, Decorator, OverloadedFuncDef)):
-                if cdef.info.names[stmt.name()].plugin_generated and not ir.is_ext_class:
-                    # Ignore plugin generated methods when creating non-extension classes
+                # Ignore plugin generated methods (since they have no
+                # bodies to compile and will need to have the bodies
+                # provided by some other mechanism.)
+                if cdef.info.names[stmt.name].plugin_generated:
                     continue
                 with self.catch_errors(stmt.line):
-                    self.visit_method(cdef, get_func_def(stmt))
+                    self.visit_method(cdef, non_ext, get_func_def(stmt))
             elif isinstance(stmt, PassStmt):
                 continue
             elif isinstance(stmt, AssignmentStmt):
-                # Variable declaration with no body
-
                 if len(stmt.lvalues) != 1:
                     self.error("Multiple assignment in class bodies not supported", stmt.line)
                     continue
@@ -1437,9 +1605,13 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                     self.error("Only assignment to variables is supported in class bodies",
                                stmt.line)
                     continue
-                if not ir.is_ext_class:
-                    self.add_non_ext_class_attr(lvalue, stmt, cdef, attrs_to_cache)
-                    continue
+                # We want to collect class variables in a dictionary for both real
+                # non-extension classes and fake dataclass ones.
+                var_non_ext = non_ext or dataclass_non_ext
+                if var_non_ext:
+                    self.add_non_ext_class_attr(var_non_ext, lvalue, stmt, cdef, attrs_to_cache)
+                    if non_ext:
+                        continue
                 # Variable declaration with no body
                 if isinstance(stmt.rvalue, TempNode):
                     continue
@@ -1451,19 +1623,22 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                 self.primitive_op(
                     py_setattr_op, [typ, self.load_static_unicode(lvalue.name), value], stmt.line)
                 if self.non_function_scope() and stmt.is_final_def:
-                    self.init_final_static(lvalue, value, cdef.fullname)
+                    self.init_final_static(lvalue, value, cdef.name)
             elif isinstance(stmt, ExpressionStmt) and isinstance(stmt.expr, StrExpr):
                 # Docstring. Ignore
                 pass
             else:
                 self.error("Unsupported statement in class body", stmt.line)
 
-        if ir.is_ext_class:
+        if not non_ext:  # That is, an extension class
             self.generate_attr_defaults(cdef)
             self.create_ne_from_eq(cdef)
+            if dataclass_non_ext:
+                assert type_obj
+                self.dataclass_finalize(cdef, dataclass_non_ext, type_obj)
         else:
             # Dynamically create the class via the type constructor
-            non_ext_class = self.load_non_ext_class(ir, cdef.line)
+            non_ext_class = self.load_non_ext_class(ir, non_ext, cdef.line)
             non_ext_class = self.load_decorated_class(cdef, non_ext_class)
 
             # Save the decorated class
@@ -1488,7 +1663,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                                  [self.load_static_unicode(attr) for attr in attrs],
                                  line)
 
-    def allocate_class(self, cdef: ClassDef) -> None:
+    def allocate_class(self, cdef: ClassDef) -> Value:
         # OK AND NOW THE FUN PART
         base_exprs = cdef.base_type_exprs + cdef.removed_base_type_exprs
         if base_exprs:
@@ -1503,10 +1678,12 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         tp = self.primitive_op(pytype_from_template_op,
                                [template, tp_bases, modname], cdef.line)
         # Immediately fix up the trait vtables, before doing anything with the class.
-        self.add(Call(
-            FuncDecl(cdef.name + '_trait_vtable_setup',
-                     None, self.module_name,
-                     FuncSignature([], bool_rprimitive)), [], -1))
+        ir = self.mapper.type_to_ir[cdef.info]
+        if not ir.is_trait and not ir.builtin_base:
+            self.add(Call(
+                FuncDecl(cdef.name + '_trait_vtable_setup',
+                         None, self.module_name,
+                         FuncSignature([], bool_rprimitive)), [], -1))
         # Populate a '__mypyc_attrs__' field containing the list of attrs
         self.primitive_op(py_setattr_op, [
             tp, self.load_static_unicode('__mypyc_attrs__'),
@@ -1521,17 +1698,19 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                           [self.load_globals_dict(), self.load_static_unicode(cdef.name),
                            tp], cdef.line)
 
+        return tp
+
     def gen_import(self, id: str, line: int) -> None:
         self.imports[id] = None
 
         needs_import, out = BasicBlock(), BasicBlock()
-        first_load = self.add(LoadStatic(object_rprimitive, 'module', id))
+        first_load = self.load_module(id)
         comparison = self.binary_op(first_load, self.none_object(), 'is not', line)
         self.add_bool_branch(comparison, out, needs_import)
 
         self.activate_block(needs_import)
         value = self.primitive_op(import_op, [self.load_static_unicode(id)], line)
-        self.add(InitStatic(value, 'module', id))
+        self.add(InitStatic(value, id, namespace=NAMESPACE_MODULE))
         self.goto_and_activate(out)
 
     def visit_import(self, node: Import) -> None:
@@ -1577,7 +1756,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         id = importlib.util.resolve_name('.' * node.relative + node.id, module_package)
 
         self.gen_import(id, node.line)
-        module = self.add(LoadStatic(object_rprimitive, 'module', id))
+        module = self.load_module(id)
 
         # Copy everything into our module's dict.
         # Note that we miscompile import from inside of functions here,
@@ -1602,8 +1781,28 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             return
         self.gen_import(node.id, node.line)
 
+    def gen_glue(self, sig: FuncSignature, target: FuncIR,
+                 cls: ClassIR, base: ClassIR, fdef: FuncItem,
+                 *,
+                 do_py_ops: bool = False
+                 ) -> FuncIR:
+        """Generate glue methods that mediate between different method types in subclasses.
+
+        Works on both properties and methods. See gen_glue_methods below for more details.
+
+        If do_py_ops is True, then the glue methods should use generic
+        C API operations instead of direct calls, to enable generating
+        "shadow" glue methods that work with interpreted subclasses.
+        """
+        if fdef.is_property:
+            return self.gen_glue_property(sig, target, cls, base, fdef.line, do_py_ops)
+        else:
+            return self.gen_glue_method(sig, target, cls, base, fdef.line, do_py_ops)
+
     def gen_glue_method(self, sig: FuncSignature, target: FuncIR,
-                        cls: ClassIR, base: ClassIR, line: int) -> FuncIR:
+                        cls: ClassIR, base: ClassIR, line: int,
+                        do_pycall: bool,
+                        ) -> FuncIR:
         """Generate glue methods that mediate between different method types in subclasses.
 
         For example, if we have:
@@ -1611,7 +1810,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         class A:
             def f(self, x: int) -> object: ...
 
-        then it is totally permissable to have a subclass
+        then it is totally permissible to have a subclass
 
         class B(A):
             def f(self, x: object) -> int: ...
@@ -1625,6 +1824,9 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         we need to generate glue methods that mediate between the
         different versions by coercing the arguments and return
         values.
+
+        If do_pycall is True, then make the call using the C API
+        instead of a native call.
         """
         self.enter(FuncInfo())
         self.ret_types[-1] = sig.ret_type
@@ -1640,7 +1842,11 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         arg_names = [arg.name for arg in rt_args]
         arg_kinds = [concrete_arg_kind(arg.kind) for arg in rt_args]
 
-        retval = self.call(target.decl, args, arg_kinds, arg_names, line)
+        if do_pycall:
+            retval = self.py_method_call(
+                args[0], target.name, args[1:], line, arg_kinds[1:], arg_names[1:])
+        else:
+            retval = self.call(target.decl, args, arg_kinds, arg_names, line)
         retval = self.coerce(retval, sig.ret_type, line)
         self.add(Return(retval))
 
@@ -1653,16 +1859,26 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             blocks, env)
 
     def gen_glue_property(self, sig: FuncSignature, target: FuncIR, cls: ClassIR, base: ClassIR,
-                          line: int) -> FuncIR:
-        """Similarly to methods, properties of derived types can be covariantly subtyped. Thus,
+                          line: int,
+                          do_pygetattr: bool) -> FuncIR:
+        """Generate glue methods for properties that mediate between different subclass types.
+
+        Similarly to methods, properties of derived types can be covariantly subtyped. Thus,
         properties also require glue. However, this only requires the return type to change.
-        Further, instead of a method call, an attribute get is performed."""
+        Further, instead of a method call, an attribute get is performed.
+
+        If do_pygetattr is True, then get the attribute using the C
+        API instead of a native call.
+        """
         self.enter(FuncInfo())
 
         rt_arg = RuntimeArg(SELF_NAME, RInstance(cls))
         arg = self.read(self.add_self_to_env(cls), line)
         self.ret_types[-1] = sig.ret_type
-        retval = self.add(GetAttr(arg, target.name, line))
+        if do_pygetattr:
+            retval = self.py_get_attr(arg, target.name, line)
+        else:
+            retval = self.add(GetAttr(arg, target.name, line))
         retbox = self.coerce(retval, sig.ret_type, line)
         self.add(Return(retbox))
 
@@ -1692,11 +1908,24 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         fake_vars = [(Var(arg.name), arg.type) for arg in rt_args]
         args = [self.read(self.environment.add_local_reg(var, type, is_arg=True), line)
                 for var, type in fake_vars]  # type: List[Value]
-        self.ret_types[-1] = bool_rprimitive
+        self.ret_types[-1] = object_rprimitive
 
-        retval = self.add(MethodCall(args[0], '__eq__', [args[1]], line))
-        retval = self.unary_op(retval, 'not', line)
+        # If __eq__ returns NotImplemented, then __ne__ should also
+        not_implemented_block, regular_block = BasicBlock(), BasicBlock()
+        eqval = self.add(MethodCall(args[0], '__eq__', [args[1]], line))
+        not_implemented = self.primitive_op(not_implemented_op, [], line)
+        self.add(Branch(
+            self.binary_op(eqval, not_implemented, 'is', line),
+            not_implemented_block,
+            regular_block,
+            Branch.BOOL_EXPR))
+
+        self.activate_block(regular_block)
+        retval = self.coerce(self.unary_op(eqval, 'not', line), object_rprimitive, line)
         self.add(Return(retval))
+
+        self.activate_block(not_implemented_block)
+        self.add(Return(not_implemented))
 
         blocks, env, ret_type, _ = self.leave()
         return FuncIR(
@@ -1729,11 +1958,11 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                 value = self.coerce(self.accept(arg.initializer),
                                     env.lookup(arg.variable).type, arg.line)
                 if not fn_info.is_nested:
-                    name = fitem.fullname() + '.' + arg.variable.name()
-                    self.add(InitStatic(value, name, 'final'))
+                    name = fitem.fullname + '.' + arg.variable.name
+                    self.add(InitStatic(value, name, self.module_name))
                 else:
                     assert func_reg is not None
-                    self.add(SetAttr(func_reg, arg.variable.name(), value, arg.line))
+                    self.add(SetAttr(func_reg, arg.variable.name, value, arg.line))
 
     def gen_arg_defaults(self) -> None:
         """Generate blocks for arguments that have default values.
@@ -1756,11 +1985,11 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                     # Because gen_arg_defaults runs before calculate_arg_defaults, we
                     # add the static/attribute to final_names/the class here.
                     elif not self.fn_info.is_nested:
-                        name = fitem.fullname() + '.' + arg.variable.name()
+                        name = fitem.fullname + '.' + arg.variable.name
                         self.final_names.append((name, target.type))
-                        return self.add(LoadStatic(target.type, name, 'final'))
+                        return self.add(LoadStatic(target.type, name, self.module_name))
                     else:
-                        name = arg.variable.name()
+                        name = arg.variable.name
                         self.fn_info.callable_class.ir.attributes[name] = target.type
                         return self.add(
                             GetAttr(self.fn_info.callable_class.self_reg, name, arg.line))
@@ -1873,7 +2102,8 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             env_for_func = self.fn_info.callable_class
 
         if self.fn_info.fitem in self.free_variables:
-            for var in self.free_variables[self.fn_info.fitem]:
+            # Sort the variables to keep things deterministic
+            for var in sorted(self.free_variables[self.fn_info.fitem], key=lambda x: x.name):
                 if isinstance(var, Var):
                     rtype = self.type_to_rtype(var.type)
                     self.add_var_to_env_class(var, rtype, env_for_func, reassign=False)
@@ -1931,14 +2161,17 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             func_reg = self.instantiate_callable_class(fn_info)
         else:
             assert isinstance(fn_info.fitem, FuncDef)
+            func_decl = self.mapper.func_to_decl[fn_info.fitem]
             if fn_info.is_decorated:
                 class_name = None if cdef is None else cdef.name
-                func_decl = FuncDecl(fn_info.name, class_name, self.module_name, sig)
+                func_decl = FuncDecl(fn_info.name, class_name, self.module_name, sig,
+                                     func_decl.kind,
+                                     func_decl.is_prop_getter, func_decl.is_prop_setter)
                 func_ir = FuncIR(func_decl, blocks, env, fn_info.fitem.line,
-                                 traceback_name=fn_info.fitem.name())
+                                 traceback_name=fn_info.fitem.name)
             else:
-                func_ir = FuncIR(self.mapper.func_to_decl[fn_info.fitem], blocks, env,
-                                 fn_info.fitem.line, traceback_name=fn_info.fitem.name())
+                func_ir = FuncIR(func_decl, blocks, env,
+                                 fn_info.fitem.line, traceback_name=fn_info.fitem.name)
         return (func_ir, func_reg)
 
     def load_decorated_func(self, fdef: FuncDef, orig_func_reg: Value) -> Value:
@@ -1968,7 +2201,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             self.add_implicit_unreachable()
 
     def visit_func_def(self, fdef: FuncDef) -> None:
-        func_ir, func_reg = self.gen_func_item(fdef, fdef.name(), self.mapper.fdef_to_sig(fdef))
+        func_ir, func_reg = self.gen_func_item(fdef, fdef.name, self.mapper.fdef_to_sig(fdef))
 
         # If the function that was visited was a nested function, then either look it up in our
         # current environment or define it if it was not already defined.
@@ -2006,7 +2239,11 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             self.add(Unreachable())
 
     def visit_expression_stmt(self, stmt: ExpressionStmt) -> None:
-        self.accept(stmt.expr)
+        if isinstance(stmt.expr, StrExpr):
+            # Docstring. Ignore
+            return
+        # ExpressionStmts do not need to be coerced like other Expressions.
+        stmt.expr.accept(self)
 
     def visit_return_stmt(self, stmt: ReturnStmt) -> None:
         if stmt.expr:
@@ -2041,19 +2278,21 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         assert isinstance(lvalue.node, Var)
         if lvalue.node.final_value is None:
             if class_name is None:
-                name = lvalue.fullname
+                name = lvalue.name
             else:
                 name = '{}.{}'.format(class_name, lvalue.name)
             assert name is not None, "Full name not set for variable"
             self.final_names.append((name, rvalue_reg.type))
-            self.add(InitStatic(rvalue_reg, name, 'final'))
+            self.add(InitStatic(rvalue_reg, name, self.module_name))
 
     def load_final_static(self, fullname: str, typ: RType, line: int,
                           error_name: Optional[str] = None) -> Value:
         if error_name is None:
             error_name = fullname
         ok_block, error_block = BasicBlock(), BasicBlock()
-        value = self.add(LoadStatic(typ, fullname, 'final', line=line))
+        split_name = split_target(self.graph, fullname)
+        assert split_name is not None
+        value = self.add(LoadStatic(typ, split_name[1], split_name[0], line=line))
         self.add(Branch(value, error_block, ok_block, Branch.IS_ERROR, rare=True))
         self.activate_block(error_block)
         self.add(RaiseStandardError(RaiseStandardError.VALUE_ERROR,
@@ -2607,9 +2846,15 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             return None
 
         class_ir = ltype.class_ir
-        # Check whether any subclasses of the operand redefines __eq__.
-        cmp_varies_at_runtime = (not class_ir.is_method_final('__eq__')
-            or not class_ir.is_method_final('__ne__'))
+        # Check whether any subclasses of the operand redefines __eq__
+        # or it might be redefined in a Python parent class or by
+        # dataclasses
+        cmp_varies_at_runtime = (
+            not class_ir.is_method_final('__eq__')
+            or not class_ir.is_method_final('__ne__')
+            or class_ir.inherits_python
+            or class_ir.is_augmented
+        )
 
         if cmp_varies_at_runtime:
             # We might need to call left.__eq__(right) or right.__eq__(left)
@@ -2711,11 +2956,15 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         value = bytes(expr.value, 'utf8').decode('unicode-escape').encode('raw-unicode-escape')
         return self.load_static_bytes(value)
 
+    def is_native_module(self, module: str) -> bool:
+        """Is the given module one compiled by mypyc?"""
+        return module in self.mapper.group_map
+
     def is_native_ref_expr(self, expr: RefExpr) -> bool:
         if expr.node is None:
             return False
-        if '.' in expr.node.fullname():
-            return expr.node.fullname().rpartition('.')[0] in self.modules
+        if '.' in expr.node.fullname:
+            return self.is_native_module(expr.node.fullname.rpartition('.')[0])
         return True
 
     def is_native_module_ref_expr(self, expr: RefExpr) -> bool:
@@ -2747,17 +2996,17 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             sym = expr.expr.node.get(expr.name)
             if sym and isinstance(sym.node, Var):
                 # Enum attribute are treated as final since they are added to the global cache
-                expr_fullname = expr.expr.node.bases[0].type.fullname()
+                expr_fullname = expr.expr.node.bases[0].type.fullname
                 is_final = sym.node.is_final or expr_fullname == 'enum.Enum'
                 if is_final:
                     final_var = sym.node
-                    fullname = '{}.{}'.format(sym.node.info.fullname(), final_var.name())
-                    native = expr.expr.node.module_name in self.modules
+                    fullname = '{}.{}'.format(sym.node.info.fullname, final_var.name)
+                    native = self.is_native_module(expr.expr.node.module_name)
         elif self.is_module_member_expr(expr):
             # a module attribute
             if isinstance(expr.node, Var) and expr.node.is_final:
                 final_var = expr.node
-                fullname = expr.node.fullname()
+                fullname = expr.node.fullname
                 native = self.is_native_ref_expr(expr)
         if final_var is not None:
             return fullname, final_var, native
@@ -2785,7 +3034,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
 
     def visit_name_expr(self, expr: NameExpr) -> Value:
         assert expr.node, "RefExpr not resolved"
-        fullname = expr.node.fullname()
+        fullname = expr.node.fullname
         if fullname in name_ref_ops:
             # Use special access op for this particular name.
             desc = name_ref_ops[fullname]
@@ -2799,8 +3048,8 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             if value is not None:
                 return value
 
-        if isinstance(expr.node, MypyFile) and expr.node.fullname() in self.imports:
-            return self.load_module(expr.node.fullname())
+        if isinstance(expr.node, MypyFile) and expr.node.fullname in self.imports:
+            return self.load_module(expr.node.fullname)
 
         # If the expression is locally defined, then read the result from the corresponding
         # assignment target and return it. Otherwise if the expression is a global, load it from
@@ -2814,7 +3063,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                     and expr.node.is_inferred):
                 self.error(
                     "Local variable '{}' has inferred type None; add an annotation".format(
-                        expr.node.name()),
+                        expr.node.name),
                     expr.node.line)
 
             # TODO: Behavior currently only defined for Var and FuncDef node types.
@@ -2830,13 +3079,13 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         final = self.get_final_ref(expr)
         if final is not None:
             fullname, final_var, native = final
-            value = self.emit_load_final(final_var, fullname, final_var.name(), native,
+            value = self.emit_load_final(final_var, fullname, final_var.name, native,
                                          self.types[expr], expr.line)
             if value is not None:
                 return value
 
-        if isinstance(expr.node, MypyFile) and expr.node.fullname() in self.imports:
-            return self.load_module(expr.node.fullname())
+        if isinstance(expr.node, MypyFile) and expr.node.fullname in self.imports:
+            return self.load_module(expr.node.fullname)
 
         obj = self.accept(expr.expr)
         return self.get_attr(obj, expr.name, self.node_type(expr), expr.line)
@@ -2940,7 +3189,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         its children, use even faster type comparison checks `type(obj) is typ`.
         """
         concrete = all_concrete_classes(class_ir)
-        if len(concrete) > FAST_ISINSTANCE_MAX_SUBCLASSES + 1:
+        if concrete is None or len(concrete) > FAST_ISINSTANCE_MAX_SUBCLASSES + 1:
             return self.primitive_op(fast_isinstance_op,
                                      [obj, self.get_native_type(class_ir)],
                                      line)
@@ -2968,7 +3217,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                 arg_values: List[Value],
                 line: int,
                 arg_kinds: Optional[List[int]] = None,
-                arg_names: Optional[List[Optional[str]]] = None) -> Value:
+                arg_names: Optional[Sequence[Optional[str]]] = None) -> Value:
         """Use py_call_op or py_call_with_kwargs_op for function call."""
         # If all arguments are positional, we can use py_call_op.
         if (arg_kinds is None) or all(kind == ARG_POS for kind in arg_kinds):
@@ -3017,8 +3266,8 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                        method_name: str,
                        arg_values: List[Value],
                        line: int,
-                       arg_kinds: Optional[List[int]] = None,
-                       arg_names: Optional[List[Optional[str]]] = None) -> Value:
+                       arg_kinds: Optional[List[int]],
+                       arg_names: Optional[Sequence[Optional[str]]]) -> Value:
         if (arg_kinds is None) or all(kind == ARG_POS for kind in arg_kinds):
             method_name_reg = self.load_static_unicode(method_name)
             return self.primitive_op(py_method_call_op, [obj, method_name_reg] + arg_values, line)
@@ -3112,7 +3361,12 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         if self.is_native_ref_expr(callee):
             # Call to module-level native function or such
             return self.translate_call(expr, callee)
-        elif isinstance(callee.expr, RefExpr) and callee.expr.node in self.mapper.type_to_ir:
+        elif (
+            isinstance(callee.expr, RefExpr)
+            and isinstance(callee.expr.node, TypeInfo)
+            and callee.expr.node in self.mapper.type_to_ir
+            and self.mapper.type_to_ir[callee.expr.node].has_method(callee.name)
+        ):
             # Call a method via the *class*
             assert isinstance(callee.expr.node, TypeInfo)
             ir = self.mapper.type_to_ir[callee.expr.node]
@@ -3121,7 +3375,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             arg_kinds, arg_names = expr.arg_kinds[:], expr.arg_names[:]
             # Add the class argument for class methods in extension classes
             if decl.kind == FUNC_CLASSMETHOD and ir.is_ext_class:
-                args.append(self.load_native_type_object(callee.expr.node.fullname()))
+                args.append(self.load_native_type_object(callee.expr.node.fullname))
                 arg_kinds.insert(0, ARG_POS)
                 arg_names.insert(0, None)
             args += [self.accept(arg) for arg in expr.args]
@@ -3861,12 +4115,13 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         for arg, arg_type in zip(expr.arguments, typ.arg_types):
             arg.variable.type = arg_type
             runtime_args.append(
-                RuntimeArg(arg.variable.name(), self.type_to_rtype(arg_type), arg.kind))
+                RuntimeArg(arg.variable.name, self.type_to_rtype(arg_type), arg.kind))
         ret_type = self.type_to_rtype(typ.ret_type)
 
         fsig = FuncSignature(runtime_args, ret_type)
 
         fname = '{}{}'.format(LAMBDA_NAME, self.lambda_counter)
+        self.lambda_counter += 1
         func_ir, func_reg = self.gen_func_item(expr, fname, fsig)
         assert func_reg is not None
 
@@ -4001,7 +4256,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         handle_loop(loop_params)
 
     def visit_decorator(self, dec: Decorator) -> None:
-        func_ir, func_reg = self.gen_func_item(dec.func, dec.func.name(),
+        func_ir, func_reg = self.gen_func_item(dec.func, dec.func.name,
                                                self.mapper.fdef_to_sig(dec.func))
 
         if dec.func in self.nested_fitems:
@@ -4011,7 +4266,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             func_reg = decorated_func
         else:
             # Obtain the the function name in order to construct the name of the helper function.
-            name = dec.func.fullname().split('.')[-1]
+            name = dec.func.fullname.split('.')[-1]
             helper_name = decorator_helper_name(name)
 
             # Load the callable object representing the non-decorated function, and decorate it.
@@ -4021,7 +4276,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             # Set the callable object representing the decorated function as a global.
             self.primitive_op(dict_set_item_op,
                               [self.load_globals_dict(),
-                               self.load_static_unicode(dec.func.name()), decorated_func],
+                               self.load_static_unicode(dec.func.name), decorated_func],
                               decorated_func.line)
 
         self.functions.append(func_ir)
@@ -4057,7 +4312,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
             args = [self.accept(arg) for arg in o.call.args]
         else:
             assert o.info is not None
-            typ = self.load_native_type_object(o.info.fullname())
+            typ = self.load_native_type_object(o.info.fullname)
             ir = self.mapper.type_to_ir[o.info]
             iter_env = iter(self.environment.indexes)
             vself = next(iter_env)  # grab first argument
@@ -4614,8 +4869,8 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         assert isinstance(env.type, RInstance), '{} must be of type RInstance'.format(env)
 
         for symbol, target in outer_env.symtable.items():
-            env.type.class_ir.attributes[symbol.name()] = target.type
-            symbol_target = AssignmentTargetAttr(env, symbol.name())
+            env.type.class_ir.attributes[symbol.name] = target.type
+            symbol_target = AssignmentTargetAttr(env, symbol.name)
             self.environment.add_target(symbol, symbol_target)
 
         return env
@@ -4667,14 +4922,14 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                              reassign: bool = False) -> AssignmentTarget:
         # First, define the variable name as an attribute of the environment class, and then
         # construct a target for that attribute.
-        self.fn_info.env_class.attributes[var.name()] = rtype
-        attr_target = AssignmentTargetAttr(base.curr_env_reg, var.name())
+        self.fn_info.env_class.attributes[var.name] = rtype
+        attr_target = AssignmentTargetAttr(base.curr_env_reg, var.name)
 
         if reassign:
             # Read the local definition of the variable, and set the corresponding attribute of
             # the environment class' variable to be that value.
             reg = self.read(self.environment.lookup(var), self.fn_info.fitem.line)
-            self.add(SetAttr(base.curr_env_reg, var.name(), reg, self.fn_info.fitem.line))
+            self.add(SetAttr(base.curr_env_reg, var.name, reg, self.fn_info.fitem.line))
 
         # Override the local definition of the variable to instead point at the variable in
         # the environment class.
@@ -4688,7 +4943,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         """
         # First, set the attribute of the environment class so that GetAttr can be called on it.
         prev_env = self.fn_infos[-2].env_class
-        prev_env.attributes[fdef.name()] = self.type_to_rtype(fdef.type)
+        prev_env.attributes[fdef.name] = self.type_to_rtype(fdef.type)
 
         if isinstance(base, GeneratorClass):
             # If we are dealing with a generator class, then we need to first get the register
@@ -4700,7 +4955,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
 
         # Obtain the instance of the callable class representing the FuncDef, and add it to the
         # current environment.
-        val = self.add(GetAttr(prev_env_reg, fdef.name(), -1))
+        val = self.add(GetAttr(prev_env_reg, fdef.name, -1))
         target = self.environment.add_local_reg(fdef, object_rprimitive)
         self.assign(target, val, -1)
 
@@ -4825,7 +5080,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         sig = FuncSignature((RuntimeArg(SELF_NAME, object_rprimitive),) + sig.args, sig.ret_type)
         call_fn_decl = FuncDecl('__call__', fn_info.callable_class.ir.name, self.module_name, sig)
         call_fn_ir = FuncIR(call_fn_decl, blocks, env,
-                            fn_info.fitem.line, traceback_name=fn_info.fitem.name())
+                            fn_info.fitem.line, traceback_name=fn_info.fitem.name)
         fn_info.callable_class.ir.methods['__call__'] = call_fn_ir
         return call_fn_ir
 
@@ -4975,7 +5230,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         helper_fn_decl = FuncDecl('__mypyc_generator_helper__', fn_info.generator_class.ir.name,
                                   self.module_name, sig)
         helper_fn_ir = FuncIR(helper_fn_decl, blocks, env,
-                              fn_info.fitem.line, traceback_name=fn_info.fitem.name())
+                              fn_info.fitem.line, traceback_name=fn_info.fitem.name)
         fn_info.generator_class.ir.methods['__mypyc_generator_helper__'] = helper_fn_ir
         self.functions.append(helper_fn_ir)
         return helper_fn_decl
@@ -5180,7 +5435,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
 
     def is_builtin_ref_expr(self, expr: RefExpr) -> bool:
         assert expr.node, "RefExpr not resolved"
-        return '.' in expr.node.fullname() and expr.node.fullname().split('.')[0] == 'builtins'
+        return '.' in expr.node.fullname and expr.node.fullname.split('.')[0] == 'builtins'
 
     def load_global(self, expr: NameExpr) -> Value:
         """Loads a Python-level global.
@@ -5191,7 +5446,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         # If the global is from 'builtins', turn it into a module attr load instead
         if self.is_builtin_ref_expr(expr):
             assert expr.node, "RefExpr not resolved"
-            return self.load_module_attr_by_fullname(expr.node.fullname(), expr.line)
+            return self.load_module_attr_by_fullname(expr.node.fullname, expr.line)
         if (self.is_native_module_ref_expr(expr) and isinstance(expr.node, TypeInfo)
                 and not self.is_synthetic_type(expr.node)):
             assert expr.fullname is not None
@@ -5206,24 +5461,27 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
     def load_globals_dict(self) -> Value:
         return self.add(LoadStatic(dict_rprimitive, 'globals', self.module_name))
 
+    def literal_static_name(self, value: Union[int, float, complex, str, bytes]) -> str:
+        return self.mapper.literal_static_name(self.current_module, value)
+
     def load_static_int(self, value: int) -> Value:
         """Loads a static integer Python 'int' object into a register."""
-        static_symbol = self.mapper.literal_static_name(value)
+        static_symbol = self.literal_static_name(value)
         return self.add(LoadStatic(int_rprimitive, static_symbol, ann=value))
 
     def load_static_float(self, value: float) -> Value:
         """Loads a static float value into a register."""
-        static_symbol = self.mapper.literal_static_name(value)
+        static_symbol = self.literal_static_name(value)
         return self.add(LoadStatic(float_rprimitive, static_symbol, ann=value))
 
     def load_static_bytes(self, value: bytes) -> Value:
         """Loads a static bytes value into a register."""
-        static_symbol = self.mapper.literal_static_name(value)
+        static_symbol = self.literal_static_name(value)
         return self.add(LoadStatic(object_rprimitive, static_symbol, ann=value))
 
     def load_static_complex(self, value: complex) -> Value:
         """Loads a static complex value into a register."""
-        static_symbol = self.mapper.literal_static_name(value)
+        static_symbol = self.literal_static_name(value)
         return self.add(LoadStatic(object_rprimitive, static_symbol, ann=value))
 
     def load_static_unicode(self, value: str) -> Value:
@@ -5232,11 +5490,11 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         This is useful for more than just unicode literals; for example, method calls
         also require a PyObject * form for the name of the method.
         """
-        static_symbol = self.mapper.literal_static_name(value)
+        static_symbol = self.literal_static_name(value)
         return self.add(LoadStatic(str_rprimitive, static_symbol, ann=value))
 
     def load_module(self, name: str) -> Value:
-        return self.add(LoadStatic(object_rprimitive, 'module', name))
+        return self.add(LoadStatic(object_rprimitive, name, namespace=NAMESPACE_MODULE))
 
     def load_module_attr_by_fullname(self, fullname: str, line: int) -> Value:
         module, _, name = fullname.rpartition('.')

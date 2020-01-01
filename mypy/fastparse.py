@@ -1,5 +1,6 @@
 import re
 import sys
+import warnings
 
 import typing  # for typing.Type, which conflicts with types.Type
 from typing import (
@@ -154,7 +155,10 @@ def parse(source: Union[str, bytes],
         else:
             assert options.python_version[0] >= 3
             feature_version = options.python_version[1]
-        ast = ast3_parse(source, fnam, 'exec', feature_version=feature_version)
+        # Disable deprecation warnings about \u
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            ast = ast3_parse(source, fnam, 'exec', feature_version=feature_version)
 
         tree = ASTConverter(options=options,
                             is_stub=is_stub_file,
@@ -202,11 +206,11 @@ def parse_type_comment(type_comment: str,
     """
     try:
         typ = ast3_parse(type_comment, '<type_comment>', 'eval')
-    except SyntaxError as e:
+    except SyntaxError:
         if errors is not None:
             stripped_type = type_comment.split("#", 2)[0].strip()
             err_msg = "{} '{}'".format(TYPE_COMMENT_SYNTAX_ERROR, stripped_type)
-            errors.report(line, e.offset, err_msg, blocker=True, code=codes.SYNTAX)
+            errors.report(line, column, err_msg, blocker=True, code=codes.SYNTAX)
             return None, None
         else:
             raise
@@ -317,12 +321,15 @@ class ASTConverter:
         node.end_line = getattr(n, "end_lineno", None) if isinstance(n, ast3.expr) else None
         return node
 
-    def translate_expr_list(self, l: Sequence[AST]) -> List[Expression]:
-        res = []  # type: List[Expression]
+    def translate_opt_expr_list(self, l: Sequence[Optional[AST]]) -> List[Optional[Expression]]:
+        res = []  # type: List[Optional[Expression]]
         for e in l:
             exp = self.visit(e)
             res.append(exp)
         return res
+
+    def translate_expr_list(self, l: Sequence[AST]) -> List[Expression]:
+        return cast(List[Expression], self.translate_opt_expr_list(l))
 
     def get_lineno(self, node: Union[ast3.expr, ast3.stmt]) -> int:
         if (isinstance(node, (ast3.AsyncFunctionDef, ast3.ClassDef, ast3.FunctionDef))
@@ -427,7 +434,7 @@ class ASTConverter:
         for stmt in stmts:
             if (current_overload_name is not None
                     and isinstance(stmt, (Decorator, FuncDef))
-                    and stmt.name() == current_overload_name):
+                    and stmt.name == current_overload_name):
                 current_overload.append(stmt)
             else:
                 if len(current_overload) == 1:
@@ -437,7 +444,7 @@ class ASTConverter:
 
                 if isinstance(stmt, Decorator):
                     current_overload = [stmt]
-                    current_overload_name = stmt.name()
+                    current_overload_name = stmt.name
                 else:
                     current_overload = []
                     current_overload_name = None
@@ -505,7 +512,7 @@ class ASTConverter:
 
         posonlyargs = [arg.arg for arg in getattr(n.args, "posonlyargs", [])]
         arg_kinds = [arg.kind for arg in args]
-        arg_names = [arg.variable.name() for arg in args]  # type: List[Optional[str]]
+        arg_names = [arg.variable.name for arg in args]  # type: List[Optional[str]]
         arg_names = [None if argument_elide_name(name) or name in posonlyargs else name
                      for name in arg_names]
         if special_function_elide_names(n.name):
@@ -606,7 +613,7 @@ class ASTConverter:
                 # existing "# type: ignore" comments working:
                 end_lineno = n.decorator_list[0].lineno + len(n.decorator_list)
 
-            var = Var(func_def.name())
+            var = Var(func_def.name)
             var.is_ready = False
             var.set_line(lineno)
 
@@ -672,7 +679,7 @@ class ASTConverter:
             new_args.append(self.make_argument(args.kwarg, None, ARG_STAR2, no_type_check))
             names.append(args.kwarg)
 
-        check_arg_names([arg.variable.name() for arg in new_args], names, self.fail_arg)
+        check_arg_names([arg.variable.name for arg in new_args], names, self.fail_arg)
 
         return new_args
 
@@ -984,7 +991,7 @@ class ASTConverter:
 
     # Dict(expr* keys, expr* values)
     def visit_Dict(self, n: ast3.Dict) -> DictExpr:
-        e = DictExpr(list(zip(self.translate_expr_list(n.keys),
+        e = DictExpr(list(zip(self.translate_opt_expr_list(n.keys),
                               self.translate_expr_list(n.values))))
         return self.set_line(e, n)
 

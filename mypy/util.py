@@ -424,9 +424,12 @@ def get_terminal_width() -> int:
     """Get current terminal width if possible, otherwise return the default one."""
     try:
         cols, _ = os.get_terminal_size()
-        return cols
     except OSError:
         return DEFAULT_COLUMNS
+    else:
+        if cols == 0:
+            return DEFAULT_COLUMNS
+        return cols
 
 
 def soft_wrap(msg: str, max_len: int, first_offset: int,
@@ -568,7 +571,8 @@ class FancyFormatter:
     def fit_in_terminal(self, messages: List[str],
                         fixed_terminal_width: Optional[int] = None) -> List[str]:
         """Improve readability by wrapping error messages and trimming source code."""
-        width = fixed_terminal_width or get_terminal_width()
+        width = (fixed_terminal_width or int(os.getenv('MYPY_FORCE_TERMINAL_WIDTH', '0')) or
+                 get_terminal_width())
         new_messages = messages.copy()
         for i, error in enumerate(messages):
             if ': error:' in error:

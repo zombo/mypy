@@ -299,6 +299,32 @@ _testOpenReturnTypeInferenceSpecialCases.py:2: note: Revealed type is 'typing.Bi
 _testOpenReturnTypeInferenceSpecialCases.py:3: note: Revealed type is 'typing.BinaryIO'
 _testOpenReturnTypeInferenceSpecialCases.py:5: note: Revealed type is 'typing.IO[Any]'
 
+[case testPathOpenReturnTypeInference]
+from pathlib import Path
+p = Path("x")
+reveal_type(p.open())
+reveal_type(p.open('r'))
+reveal_type(p.open('rb'))
+mode = 'rb'
+reveal_type(p.open(mode))
+[out]
+_program.py:3: note: Revealed type is 'typing.TextIO'
+_program.py:4: note: Revealed type is 'typing.TextIO'
+_program.py:5: note: Revealed type is 'typing.BinaryIO'
+_program.py:7: note: Revealed type is 'typing.IO[Any]'
+
+[case testPathOpenReturnTypeInferenceSpecialCases]
+from pathlib import Path
+p = Path("x")
+reveal_type(p.open(mode='rb', errors='replace'))
+reveal_type(p.open(errors='replace', mode='rb'))
+mode = 'rb'
+reveal_type(p.open(mode=mode, errors='replace'))
+[out]
+_program.py:3: note: Revealed type is 'typing.BinaryIO'
+_program.py:4: note: Revealed type is 'typing.BinaryIO'
+_program.py:6: note: Revealed type is 'typing.IO[Any]'
+
 [case testGenericPatterns]
 from typing import Pattern
 import re
@@ -599,8 +625,7 @@ f(tuple())
 [out]
 ()
 
-[case testMapWithLambdaSpecialCase-skip]
-# TODO: Fix this; this was broken at some point but not sure why.
+[case testMapWithLambdaSpecialCase]
 from typing import List, Iterator
 a = [[1], [3]]
 b = map(lambda y: y[0], a)
@@ -900,8 +925,8 @@ collections.Deque()
 typing.deque()
 
 [out]
-_testDequeWrongCase.py:4: error: Module has no attribute "Deque"
-_testDequeWrongCase.py:5: error: Module has no attribute "deque"
+_testDequeWrongCase.py:4: error: Module has no attribute "Deque"; maybe "deque"?
+_testDequeWrongCase.py:5: error: Module has no attribute "deque"; maybe "Deque"?
 
 [case testDictUpdateInference]
 from typing import Dict, Optional
@@ -1236,7 +1261,7 @@ bar: Type[C]
 
 bar * 4 + bar + 3  # should not produce more errors
 [out]
-_testMetaclassOpAccessAny.py:2: error: Cannot find module named 'nonexistent'
+_testMetaclassOpAccessAny.py:2: error: Cannot find implementation or library stub for module named 'nonexistent'
 _testMetaclassOpAccessAny.py:2: note: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
 
 [case testEnumIterationAndPreciseElementType]
@@ -1453,3 +1478,12 @@ def f_suppresses() -> int:
 [out]
 _testUnreachableWithStdlibContextManagersNoStrictOptional.py:9: error: Statement is unreachable
 _testUnreachableWithStdlibContextManagersNoStrictOptional.py:15: error: Statement is unreachable
+
+[case testAsyncioFutureWait]
+# mypy: strict-optional
+from asyncio import Future, wait
+from typing import List
+
+async def foo() -> None:
+    f = []  # type: List[Future[None]]
+    await wait(f)
